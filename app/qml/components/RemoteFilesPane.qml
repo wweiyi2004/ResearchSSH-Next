@@ -466,30 +466,37 @@ Rectangle {
         property bool isDir: false
         property bool editable: false
         property var size: 0
+        topPadding: 4
+        bottomPadding: 4
 
         MenuItem {
             text: "打开到编辑器"
+            implicitHeight: 26
             enabled: root.controller.fileAvailable && fileMenu.editable && !fileMenu.isDir
             onTriggered: root.requestOpen(fileMenu.path, fileMenu.size)
         }
-        MenuSeparator {}
+        MenuSeparator { implicitHeight: 6 }
         MenuItem {
             text: "剪切"
+            implicitHeight: 26
             enabled: root.controller.fileAvailable
             onTriggered: root.controller.cutPath(fileMenu.path)
         }
         MenuItem {
             text: "复制"
+            implicitHeight: 26
             enabled: root.controller.fileAvailable
             onTriggered: root.controller.copyPath(fileMenu.path)
         }
         MenuItem {
             text: root.controller.clipboardCut ? "移动到此处" : "粘贴到此处"
+            implicitHeight: 26
             enabled: root.controller.fileAvailable && fileMenu.isDir && root.controller.clipboardName.length > 0
             onTriggered: root.requestPaste(fileMenu.path)
         }
         MenuItem {
             text: "重命名"
+            implicitHeight: 26
             enabled: root.controller.fileAvailable
             onTriggered: {
                 nameDialog.mode = "rename"
@@ -501,6 +508,7 @@ Rectangle {
         }
         MenuItem {
             text: "删除"
+            implicitHeight: 26
             enabled: root.controller.fileAvailable
             onTriggered: {
                 deleteDialog.path = fileMenu.path
@@ -509,9 +517,10 @@ Rectangle {
                 deleteDialog.open()
             }
         }
-        MenuSeparator {}
+        MenuSeparator { implicitHeight: 6 }
         MenuItem {
             text: "新建文件"
+            implicitHeight: 26
             enabled: root.controller.fileAvailable
             onTriggered: {
                 nameDialog.mode = "mkfile"
@@ -522,6 +531,7 @@ Rectangle {
         }
         MenuItem {
             text: "新建目录"
+            implicitHeight: 26
             enabled: root.controller.fileAvailable
             onTriggered: {
                 nameDialog.mode = "mkdir"
@@ -532,6 +542,7 @@ Rectangle {
         }
         MenuItem {
             text: "上传到此处"
+            implicitHeight: 26
             enabled: root.controller.fileAvailable && fileMenu.isDir
             onTriggered: {
                 uploadDialog.destDir = fileMenu.path

@@ -61,8 +61,9 @@ Rectangle {
                     width: Math.max(160, editorLabel.implicitWidth + 38)
                     contentItem: Text {
                         id: editorLabel
-                        text: root.controller.editor.isOpen
-                              ? root.controller.editor.fileName + (editorPane.modified ? " *" : "")
+                        text: editorPane.openDocuments.length > 0
+                              ? "编辑器 " + editorPane.openDocuments.length
+                                + (editorPane.modified ? " *" : "")
                               : "编辑器"
                         color: editorTab.checked ? Theme.text : Theme.muted
                         horizontalAlignment: Text.AlignHCenter
@@ -119,7 +120,7 @@ Rectangle {
 
     Connections {
         target: root.controller.editor
-        function onContentLoaded(text) {
+        function onContentLoaded(path, text) {
             workspaceTabs.currentIndex = 1
         }
     }

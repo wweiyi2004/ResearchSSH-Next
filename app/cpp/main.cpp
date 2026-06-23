@@ -11,6 +11,7 @@
 #include <QtGlobal>
 
 #include "AppController.h"
+#include "CodeHighlighter.h"
 
 int main(int argc, char *argv[]) {
     QGuiApplication app(argc, argv);
@@ -33,6 +34,7 @@ int main(int argc, char *argv[]) {
     }
 
     QQmlApplicationEngine engine;
+    qmlRegisterType<researchssh::CodeHighlighter>("ResearchSSH", 1, 0, "CodeHighlighter");
     engine.rootContext()->setContextProperty(QStringLiteral("app"), &controller);
 
     QObject::connect(

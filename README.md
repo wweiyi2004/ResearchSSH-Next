@@ -20,14 +20,16 @@ Widgets, no WebView, no Electron/Tauri.
 | Rust core (runtime, session FSM, provider abstraction, events) | ✅ implemented |
 | C ABI (cbindgen header, opaque handles, `catch_unwind`, batched callbacks) | ✅ implemented |
 | Mock SSH provider | ✅ implemented |
-| `russh` provider (real SSH: handshake, password auth, host-key confirm, PTY+shell) | ✅ implemented behind `--features russh`; verified by an in-process server e2e test |
+| `russh` provider (real SSH: handshake, public-key/password auth, host-key confirm, PTY+shell) | ✅ implemented behind `--features russh`; verified by in-process server e2e tests |
 | Connect-to-real-server UI (connection dialog + host-key confirm dialog) | ✅ implemented |
 | Remote file mgmt + in-app editor (file tree / copy-paste-rename / upload / edit-save) | ✅ implemented for Mock; wired through FFI/C++/QML; `russh` attempts SFTP when the server supports it |
+| Editor/terminal productivity (multi-file tabs, syntax highlight, completion, bracket pairing, Python run target, resource snapshot) | ✅ implemented in the Qt UI; resource refresh uses SSH commands when connected |
 | Rust unit tests + FFI smoke test + Mock session test | ✅ **build & pass** |
 | C++/Qt adapter (AppController, models, RustCoreBridge, CredentialStore) | ✅ implemented |
 | QML dark three-pane UI (servers · terminal · workspace tabs: connection/files) | ✅ implemented |
 | CMake + Cargo build, CMakePresets | ✅ implemented |
-| Full terminal emulator / public-key auth / port forwarding | ⛔ follow-up work |
+| Public-key auth (default-key discovery, explicit key file, optional passphrase, password fallback) | ✅ implemented |
+| Full terminal emulator / port forwarding | ⛔ follow-up work |
 
 ### What has been verified on this machine
 
@@ -91,19 +93,22 @@ cargo fmt --check
 
 To use real SSH (not just the Mock provider), build the Rust core with the `russh`
 feature via the dedicated preset, then use the **＋ 新建连接** button in the app to
-open a connection dialog (host / port / user / password). On first connect the app
-shows a **host-key confirmation** dialog; accepting writes the key to
+open a connection dialog (host / port / user / password / optional private key).
+Leaving the key path empty auto-discovers `~/.ssh/id_ed25519`, `id_ecdsa`, then
+`id_rsa`; password auth is used as a fallback when provided. On first connect the
+app shows a **host-key confirmation** dialog; accepting writes the key to
 `~/.ssh/known_hosts`.
 
 ```sh
 cmake --preset windows-msvc-russh -DCMAKE_PREFIX_PATH="E:/Qt/6.8.3/msvc2022_64"
 cmake --build --preset windows-msvc-russh
 # core only / tests:
-cd rust-core && cargo test --features russh   # incl. a real in-process SSH handshake e2e test
+cd rust-core && cargo test --features russh   # incl. public-key and password loopback e2e tests
 ```
 
 The russh backend uses the pure-Rust `ring` crypto (not `aws-lc-rs`), so it needs
-no extra C/asm toolchain. Password auth is wired; public-key auth is a follow-up.
+no extra C/asm toolchain. Public-key auth is tried first; password auth remains
+available as a fallback.
 
 ### 2. Full application (Rust core + Qt UI) — requires CMake + Qt
 
@@ -239,7 +244,7 @@ The C header (`rust-core/include/research_ssh_core.h`) is the contract.
 The highest-value follow-ups are product hardening rather than basic wiring:
 
 1. Replace the placeholder text terminal with a real VT/ANSI terminal grid.
-2. Add public-key authentication and better SSH error reporting.
+2. Improve SSH error reporting and add keyboard-interactive/agent auth.
 3. Add persistent server profiles and a real Windows Credential Manager backend.
 4. Harden file editing for large/binary files and add operation progress/cancel.
 5. Add packaging/deployment (`windeployqt`, installer) and UI tests.

@@ -12,6 +12,7 @@
 #include <QHash>
 #include <QObject>
 #include <QUrl>
+#include <QVariantList>
 #include <memory>
 
 #include "CredentialStore.h"
@@ -44,6 +45,13 @@ class AppController : public QObject {
     Q_PROPERTY(QString clipboardPath READ clipboardPath NOTIFY clipboardChanged)
     Q_PROPERTY(QString clipboardName READ clipboardName NOTIFY clipboardChanged)
     Q_PROPERTY(bool clipboardCut READ clipboardCut NOTIFY clipboardChanged)
+    Q_PROPERTY(QVariantList resourceDevices READ resourceDevices NOTIFY resourceSnapshotChanged)
+    Q_PROPERTY(QVariantList resourceProcesses READ resourceProcesses NOTIFY resourceSnapshotChanged)
+    Q_PROPERTY(QVariantList resourceProcessGroups READ resourceProcessGroups NOTIFY resourceSnapshotChanged)
+    Q_PROPERTY(QVariantList resourceJobs READ resourceJobs NOTIFY resourceSnapshotChanged)
+    Q_PROPERTY(QVariantList resourceDisks READ resourceDisks NOTIFY resourceSnapshotChanged)
+    Q_PROPERTY(QString resourceSnapshotText READ resourceSnapshotText NOTIFY resourceSnapshotChanged)
+    Q_PROPERTY(bool resourceSnapshotBusy READ resourceSnapshotBusy NOTIFY resourceSnapshotChanged)
 
 public:
     explicit AppController(QObject *parent = nullptr);
@@ -81,6 +89,13 @@ public:
     QString clipboardPath() const { return m_clipboardPath; }
     QString clipboardName() const;
     bool clipboardCut() const { return m_clipboardCut; }
+    QVariantList resourceDevices() const { return m_resourceDevices; }
+    QVariantList resourceProcesses() const { return m_resourceProcesses; }
+    QVariantList resourceProcessGroups() const { return m_resourceProcessGroups; }
+    QVariantList resourceJobs() const { return m_resourceJobs; }
+    QVariantList resourceDisks() const { return m_resourceDisks; }
+    QString resourceSnapshotText() const { return m_resourceSnapshotText; }
+    bool resourceSnapshotBusy() const { return m_resourceSnapshotBusy; }
 
 public slots:
     void selectServer(int index);
@@ -96,8 +111,13 @@ public slots:
     // Deliver the user's host-key confirmation decision.
     void confirmHostKey(bool accept);
     void sendCommand(const QString &text);
+    void sendInterrupt();
     void runQuickCommand(const QString &command);
     void clearTerminal();
+    void runPythonFile(const QString &path, const QString &device);
+    void refreshResourceSnapshot();
+    void activateEditorPath(const QString &path);
+    void closeEditor();
 
     // File-management actions (used by the file tree / editor UI).
     void openPath(const QString &path);
@@ -119,6 +139,7 @@ signals:
     void fileActivityChanged();
     void fileStatusChanged();
     void clipboardChanged();
+    void resourceSnapshotChanged();
     // Emitted when the server presents an unknown host key needing confirmation.
     void hostKeyPromptRequested(const QString &fingerprint);
 
@@ -131,6 +152,10 @@ private:
     QString targetDirForWrite(const QString &dir) const;
     void rememberHomeFromRootListing(const QVector<FsEntry> &entries);
     void setFileStatus(bool available, const QString &text);
+    void seedResourceSnapshot(const QString &statusText);
+    void parseResourceSnapshot(const QString &text);
+    void captureResourceOutput(const QByteArray &data);
+    void rebuildResourceProcessGroups();
 
     // Tracks outstanding file requests so results can be dispatched by id.
     struct PendingFs {
@@ -149,6 +174,14 @@ private:
     QString m_remoteHomePath;
     QString m_fileStatusText = QStringLiteral("连接后显示远端文件");
     bool m_fileAvailable = false;
+    QVariantList m_resourceDevices;
+    QVariantList m_resourceProcesses;
+    QVariantList m_resourceProcessGroups;
+    QVariantList m_resourceJobs;
+    QVariantList m_resourceDisks;
+    QString m_resourceSnapshotText = QStringLiteral("尚未采集资源快照");
+    bool m_resourceSnapshotBusy = false;
+    QString m_resourceCapture;
 
     RustCoreBridge m_bridge;
     ServerListModel *m_servers = nullptr;

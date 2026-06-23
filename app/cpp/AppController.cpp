@@ -1,8 +1,11 @@
 #include "AppController.h"
 
+#include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
+#include <QRegularExpression>
 #include <QStringDecoder>
+#include <QVariantMap>
 
 namespace researchssh {
 
@@ -56,6 +59,20 @@ bool isValidRemoteName(const QString &name) {
     return !trimmed.isEmpty() && !trimmed.contains('/') && !trimmed.contains('\\');
 }
 
+QString shellQuote(const QString &value) {
+    QString quoted = value;
+    quoted.replace('\'', QStringLiteral("'\\''"));
+    return QStringLiteral("'%1'").arg(quoted);
+}
+
+int clampPercent(double value) {
+    if (value < 0.0)
+        return 0;
+    if (value > 100.0)
+        return 100;
+    return static_cast<int>(value + 0.5);
+}
+
 } // namespace
 
 AppController::AppController(QObject *parent) : QObject(parent) {
@@ -64,6 +81,7 @@ AppController::AppController(QObject *parent) : QObject(parent) {
     m_fileTree = new RemoteFileTreeModel(this);
     m_editor = new EditorViewModel(this);
     m_credentials = createDefaultCredentialStore();
+    seedResourceSnapshot(QStringLiteral("示例资源快照，连接后可手动刷新"));
 
     connect(m_fileTree, &RemoteFileTreeModel::directoryExpandRequested, this,
             &AppController::expandDir);
@@ -204,12 +222,98 @@ void AppController::sendCommand(const QString &text) {
             QStringLiteral("发送失败：%1").arg(RustCoreBridge::describe(rc)));
 }
 
+void AppController::sendInterrupt() {
+    if (!m_session || m_connectionState != RsSessionState_Connected) {
+        m_terminal->appendNotice(QStringLiteral("未连接,无法中止程序。"));
+        return;
+    }
+    const QByteArray payload(1, '\x03');
+    const RsErrorCode rc = m_bridge.sendToSession(m_session, payload);
+    if (rc != RsErrorCode_Ok)
+        m_terminal->appendNotice(
+            QStringLiteral("中止信号发送失败：%1").arg(RustCoreBridge::describe(rc)));
+    else
+        m_terminal->appendNotice(QStringLiteral("已发送 Ctrl+C。"));
+}
+
 void AppController::runQuickCommand(const QString &command) {
     sendCommand(command);
 }
 
 void AppController::clearTerminal() {
     m_terminal->clear();
+}
+
+void AppController::runPythonFile(const QString &path, const QString &device) {
+    if (!m_session || m_connectionState != RsSessionState_Connected) {
+        m_terminal->appendNotice(QStringLiteral("未连接,无法运行 Python 文件。"));
+        return;
+    }
+    if (path.isEmpty() || !path.endsWith(QStringLiteral(".py"), Qt::CaseInsensitive)) {
+        m_terminal->appendNotice(QStringLiteral("请选择一个 .py 文件再运行。"));
+        return;
+    }
+
+    const QString target = device.trimmed().toLower();
+    QString envPrefix;
+    QString label;
+    if (target == QStringLiteral("cpu")) {
+        envPrefix = QStringLiteral("CUDA_VISIBLE_DEVICES='' ");
+        label = QStringLiteral("CPU");
+    } else {
+        QString gpu = target;
+        if (gpu.startsWith(QStringLiteral("gpu")))
+            gpu = gpu.mid(3).trimmed();
+        if (gpu.isEmpty())
+            gpu = QStringLiteral("0");
+        envPrefix = QStringLiteral("CUDA_VISIBLE_DEVICES=%1 ").arg(gpu);
+        label = QStringLiteral("GPU %1").arg(gpu);
+    }
+
+    m_terminal->appendNotice(QStringLiteral("运行 %1，目标：%2").arg(path, label));
+    sendCommand(QStringLiteral("%1python %2").arg(envPrefix, shellQuote(path)));
+}
+
+void AppController::refreshResourceSnapshot() {
+    if (!m_session || m_connectionState != RsSessionState_Connected) {
+        seedResourceSnapshot(QStringLiteral("未连接，显示示例资源快照"));
+        return;
+    }
+    if (m_resourceSnapshotBusy)
+        return;
+
+    m_resourceSnapshotBusy = true;
+    m_resourceCapture.clear();
+    m_resourceSnapshotText = QStringLiteral("正在采集远端资源快照...");
+    emit resourceSnapshotChanged();
+
+    const QString command = QStringLiteral(
+        "printf '__RSSH_RESOURCE_BEGIN__\\n'; "
+        "if command -v nvidia-smi >/dev/null 2>&1; then "
+        "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total "
+        "--format=csv,noheader,nounits 2>/dev/null || true; "
+        "printf '__RSSH_RESOURCE_PROCESSES__\\n'; "
+        "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory "
+        "--format=csv,noheader,nounits 2>/dev/null || true; "
+        "else printf '__RSSH_RESOURCE_PROCESSES__\\n'; fi; "
+        "printf '__RSSH_RESOURCE_CPU__\\n'; "
+        "ps -eo pid,user,comm,pcpu,pmem --sort=-pcpu 2>/dev/null | head -n 8 || true; "
+        "printf '__RSSH_RESOURCE_JOBS__\\n'; "
+        "if command -v squeue >/dev/null 2>&1; then "
+        "squeue -h -o '%i|%P|%j|%u|%T|%M|%D|%R' 2>/dev/null | head -n 8 || true; fi; "
+        "printf '__RSSH_RESOURCE_DISK__\\n'; "
+        "df -hP 2>/dev/null | awk 'NR>1 {print $1 \"|\" $2 \"|\" $3 \"|\" $4 \"|\" $5 \"|\" $6}' | head -n 8 || true; "
+        "printf '__RSSH_RESOURCE_END__\\n'");
+    sendCommand(command);
+}
+
+void AppController::activateEditorPath(const QString &path) {
+    if (!path.isEmpty())
+        m_editor->activatePath(path);
+}
+
+void AppController::closeEditor() {
+    m_editor->close();
 }
 
 QString AppController::clipboardName() const {
@@ -223,6 +327,7 @@ void AppController::ingestRustEvents(const RustEventBatch &batch) {
             setConnectionState(ev.state);
             break;
         case RsEventKind_Data:
+            captureResourceOutput(ev.data);
             m_terminal->appendBytes(ev.data);
             break;
         case RsEventKind_Error: {
@@ -631,6 +736,328 @@ void AppController::setFileStatus(bool available, const QString &text) {
     m_fileAvailable = available;
     m_fileStatusText = text;
     emit fileStatusChanged();
+}
+
+void AppController::seedResourceSnapshot(const QString &statusText) {
+    QVariantMap cpu;
+    cpu.insert(QStringLiteral("id"), QStringLiteral("CPU"));
+    cpu.insert(QStringLiteral("kind"), QStringLiteral("CPU"));
+    cpu.insert(QStringLiteral("name"), QStringLiteral("32 vCPU node"));
+    cpu.insert(QStringLiteral("utilization"), 42);
+    cpu.insert(QStringLiteral("memoryUsed"), 128);
+    cpu.insert(QStringLiteral("memoryTotal"), 256);
+
+    QVariantMap gpu0;
+    gpu0.insert(QStringLiteral("id"), QStringLiteral("GPU 0"));
+    gpu0.insert(QStringLiteral("kind"), QStringLiteral("GPU"));
+    gpu0.insert(QStringLiteral("name"), QStringLiteral("NVIDIA A100-SXM4-80GB"));
+    gpu0.insert(QStringLiteral("utilization"), 37);
+    gpu0.insert(QStringLiteral("memoryUsed"), 12345);
+    gpu0.insert(QStringLiteral("memoryTotal"), 81920);
+
+    QVariantMap gpu1;
+    gpu1.insert(QStringLiteral("id"), QStringLiteral("GPU 1"));
+    gpu1.insert(QStringLiteral("kind"), QStringLiteral("GPU"));
+    gpu1.insert(QStringLiteral("name"), QStringLiteral("NVIDIA A100-SXM4-80GB"));
+    gpu1.insert(QStringLiteral("utilization"), 5);
+    gpu1.insert(QStringLiteral("memoryUsed"), 2048);
+    gpu1.insert(QStringLiteral("memoryTotal"), 81920);
+
+    QVariantMap p0;
+    p0.insert(QStringLiteral("pid"), QStringLiteral("29418"));
+    p0.insert(QStringLiteral("user"), QStringLiteral("alice"));
+    p0.insert(QStringLiteral("name"), QStringLiteral("python train.py"));
+    p0.insert(QStringLiteral("device"), QStringLiteral("GPU 0"));
+    p0.insert(QStringLiteral("cpu"), 66);
+    p0.insert(QStringLiteral("memory"), 18);
+    p0.insert(QStringLiteral("gpuMemory"), 11840);
+
+    QVariantMap p1;
+    p1.insert(QStringLiteral("pid"), QStringLiteral("18302"));
+    p1.insert(QStringLiteral("user"), QStringLiteral("researcher"));
+    p1.insert(QStringLiteral("name"), QStringLiteral("python eval.py"));
+    p1.insert(QStringLiteral("device"), QStringLiteral("GPU 1"));
+    p1.insert(QStringLiteral("cpu"), 21);
+    p1.insert(QStringLiteral("memory"), 7);
+    p1.insert(QStringLiteral("gpuMemory"), 2048);
+
+    QVariantMap p2;
+    p2.insert(QStringLiteral("pid"), QStringLiteral("911"));
+    p2.insert(QStringLiteral("user"), QStringLiteral("root"));
+    p2.insert(QStringLiteral("name"), QStringLiteral("systemd"));
+    p2.insert(QStringLiteral("device"), QStringLiteral("CPU"));
+    p2.insert(QStringLiteral("cpu"), 4);
+    p2.insert(QStringLiteral("memory"), 1);
+    p2.insert(QStringLiteral("gpuMemory"), 0);
+
+    QVariantMap job0;
+    job0.insert(QStringLiteral("id"), QStringLiteral("102934"));
+    job0.insert(QStringLiteral("partition"), QStringLiteral("gpu"));
+    job0.insert(QStringLiteral("name"), QStringLiteral("train.sh"));
+    job0.insert(QStringLiteral("user"), QStringLiteral("alice"));
+    job0.insert(QStringLiteral("state"), QStringLiteral("RUNNING"));
+    job0.insert(QStringLiteral("time"), QStringLiteral("2:13:05"));
+    job0.insert(QStringLiteral("nodes"), QStringLiteral("4"));
+    job0.insert(QStringLiteral("where"), QStringLiteral("gpu[01-04]"));
+
+    QVariantMap disk0;
+    disk0.insert(QStringLiteral("filesystem"), QStringLiteral("/dev/nvme0n1"));
+    disk0.insert(QStringLiteral("size"), QStringLiteral("1.8T"));
+    disk0.insert(QStringLiteral("used"), QStringLiteral("0.9T"));
+    disk0.insert(QStringLiteral("available"), QStringLiteral("0.8T"));
+    disk0.insert(QStringLiteral("percent"), 53);
+    disk0.insert(QStringLiteral("mount"), QStringLiteral("/home"));
+
+    QVariantMap disk1;
+    disk1.insert(QStringLiteral("filesystem"), QStringLiteral("scratch"));
+    disk1.insert(QStringLiteral("size"), QStringLiteral("50T"));
+    disk1.insert(QStringLiteral("used"), QStringLiteral("31T"));
+    disk1.insert(QStringLiteral("available"), QStringLiteral("19T"));
+    disk1.insert(QStringLiteral("percent"), 62);
+    disk1.insert(QStringLiteral("mount"), QStringLiteral("/scratch"));
+
+    m_resourceDevices = {cpu, gpu0, gpu1};
+    m_resourceProcesses = {p0, p1, p2};
+    m_resourceJobs = {job0};
+    m_resourceDisks = {disk0, disk1};
+    rebuildResourceProcessGroups();
+    m_resourceSnapshotText = statusText;
+    m_resourceSnapshotBusy = false;
+    emit resourceSnapshotChanged();
+}
+
+void AppController::parseResourceSnapshot(const QString &text) {
+    const int begin = text.indexOf(QStringLiteral("__RSSH_RESOURCE_BEGIN__"));
+    const int end = text.indexOf(QStringLiteral("__RSSH_RESOURCE_END__"));
+    if (begin < 0 || end <= begin) {
+        m_resourceSnapshotBusy = false;
+        m_resourceSnapshotText = QStringLiteral("资源快照解析失败：未找到完整标记");
+        emit resourceSnapshotChanged();
+        return;
+    }
+
+    enum Section { GpuDevices, GpuProcesses, CpuProcesses, Jobs, Disks };
+    Section section = GpuDevices;
+    QVariantList devices;
+    QVariantList processes;
+    QVariantList jobs;
+    QVariantList disks;
+    double cpuTotal = 0.0;
+    double memTotal = 0.0;
+    QHash<QString, QString> gpuUuidToLabel;
+
+    const int bodyStart = begin + QStringLiteral("__RSSH_RESOURCE_BEGIN__").size();
+    const QString body = text.mid(bodyStart, end - bodyStart);
+    const QStringList lines = body.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
+                                         Qt::SkipEmptyParts);
+    const QRegularExpression cpuLine(
+        QStringLiteral("^\\s*(\\d+)\\s+(\\S+)\\s+(\\S+)\\s+([0-9.]+)\\s+([0-9.]+)\\s*$"));
+
+    for (QString line : lines) {
+        line = line.trimmed();
+        if (line.isEmpty() || line == QStringLiteral("__RSSH_RESOURCE_BEGIN__"))
+            continue;
+        if (line == QStringLiteral("__RSSH_RESOURCE_PROCESSES__")) {
+            section = GpuProcesses;
+            continue;
+        }
+        if (line == QStringLiteral("__RSSH_RESOURCE_CPU__")) {
+            section = CpuProcesses;
+            continue;
+        }
+        if (line == QStringLiteral("__RSSH_RESOURCE_JOBS__")) {
+            section = Jobs;
+            continue;
+        }
+        if (line == QStringLiteral("__RSSH_RESOURCE_DISK__")) {
+            section = Disks;
+            continue;
+        }
+        if (line.startsWith(QStringLiteral("PID ")))
+            continue;
+
+        if (section == GpuDevices) {
+            const QStringList parts = line.split(',', Qt::KeepEmptyParts);
+            if (parts.size() < 5)
+                continue;
+            bool okUtil = false;
+            bool okUsed = false;
+            bool okTotal = false;
+            const bool hasUuid = parts.size() >= 6;
+            const QString index = parts.at(0).trimmed();
+            const QString uuid = hasUuid ? parts.at(1).trimmed() : QString();
+            const QString name = parts.at(hasUuid ? 2 : 1).trimmed();
+            const int util = parts.at(hasUuid ? 3 : 2).trimmed().toInt(&okUtil);
+            const int used = parts.at(hasUuid ? 4 : 3).trimmed().toInt(&okUsed);
+            const int total = parts.at(hasUuid ? 5 : 4).trimmed().toInt(&okTotal);
+            if (!okUtil || !okUsed || !okTotal)
+                continue;
+            const QString label = QStringLiteral("GPU %1").arg(index);
+            if (!uuid.isEmpty())
+                gpuUuidToLabel.insert(uuid, label);
+            QVariantMap gpu;
+            gpu.insert(QStringLiteral("id"), label);
+            gpu.insert(QStringLiteral("kind"), QStringLiteral("GPU"));
+            gpu.insert(QStringLiteral("name"), name);
+            gpu.insert(QStringLiteral("utilization"), clampPercent(util));
+            gpu.insert(QStringLiteral("memoryUsed"), used);
+            gpu.insert(QStringLiteral("memoryTotal"), total);
+            devices.push_back(gpu);
+        } else if (section == GpuProcesses) {
+            const QStringList parts = line.split(',', Qt::KeepEmptyParts);
+            if (parts.size() < 3)
+                continue;
+            bool okMem = false;
+            const bool hasDevice = parts.size() >= 4;
+            QString device = hasDevice ? parts.at(0).trimmed() : QStringLiteral("GPU");
+            device = gpuUuidToLabel.value(device, device);
+            const QString pid = hasDevice ? parts.at(1).trimmed() : parts.at(0).trimmed();
+            const QString name = hasDevice ? parts.at(2).trimmed() : parts.at(1).trimmed();
+            const int gpuMem =
+                (hasDevice ? parts.at(3).trimmed() : parts.at(2).trimmed()).toInt(&okMem);
+            QVariantMap proc;
+            proc.insert(QStringLiteral("pid"), pid);
+            proc.insert(QStringLiteral("user"), QStringLiteral("-"));
+            proc.insert(QStringLiteral("name"), name);
+            proc.insert(QStringLiteral("device"), device);
+            proc.insert(QStringLiteral("cpu"), 0);
+            proc.insert(QStringLiteral("memory"), 0);
+            proc.insert(QStringLiteral("gpuMemory"), okMem ? gpuMem : 0);
+            processes.push_back(proc);
+        } else {
+            if (section == Jobs) {
+                const QStringList parts = line.split('|', Qt::KeepEmptyParts);
+                if (parts.size() < 8)
+                    continue;
+                QVariantMap job;
+                job.insert(QStringLiteral("id"), parts.at(0).trimmed());
+                job.insert(QStringLiteral("partition"), parts.at(1).trimmed());
+                job.insert(QStringLiteral("name"), parts.at(2).trimmed());
+                job.insert(QStringLiteral("user"), parts.at(3).trimmed());
+                job.insert(QStringLiteral("state"), parts.at(4).trimmed());
+                job.insert(QStringLiteral("time"), parts.at(5).trimmed());
+                job.insert(QStringLiteral("nodes"), parts.at(6).trimmed());
+                job.insert(QStringLiteral("where"), parts.at(7).trimmed());
+                jobs.push_back(job);
+                continue;
+            }
+            if (section == Disks) {
+                const QStringList parts = line.split('|', Qt::KeepEmptyParts);
+                if (parts.size() < 6)
+                    continue;
+                bool okPct = false;
+                QString pctText = parts.at(4).trimmed();
+                pctText.chop(pctText.endsWith('%') ? 1 : 0);
+                const int percent = pctText.toInt(&okPct);
+                QVariantMap disk;
+                disk.insert(QStringLiteral("filesystem"), parts.at(0).trimmed());
+                disk.insert(QStringLiteral("size"), parts.at(1).trimmed());
+                disk.insert(QStringLiteral("used"), parts.at(2).trimmed());
+                disk.insert(QStringLiteral("available"), parts.at(3).trimmed());
+                disk.insert(QStringLiteral("percent"), okPct ? clampPercent(percent) : 0);
+                disk.insert(QStringLiteral("mount"), parts.at(5).trimmed());
+                disks.push_back(disk);
+                continue;
+            }
+            const auto match = cpuLine.match(line);
+            if (!match.hasMatch())
+                continue;
+            const double cpu = match.captured(4).toDouble();
+            const double mem = match.captured(5).toDouble();
+            cpuTotal += cpu;
+            memTotal += mem;
+            QVariantMap proc;
+            proc.insert(QStringLiteral("pid"), match.captured(1));
+            proc.insert(QStringLiteral("user"), match.captured(2));
+            proc.insert(QStringLiteral("name"), match.captured(3));
+            proc.insert(QStringLiteral("device"), QStringLiteral("CPU"));
+            proc.insert(QStringLiteral("cpu"), clampPercent(cpu));
+            proc.insert(QStringLiteral("memory"), clampPercent(mem));
+            proc.insert(QStringLiteral("gpuMemory"), 0);
+            processes.push_back(proc);
+        }
+    }
+
+    QVariantMap cpu;
+    cpu.insert(QStringLiteral("id"), QStringLiteral("CPU"));
+    cpu.insert(QStringLiteral("kind"), QStringLiteral("CPU"));
+    cpu.insert(QStringLiteral("name"), QStringLiteral("Top process load"));
+    cpu.insert(QStringLiteral("utilization"), clampPercent(cpuTotal));
+    cpu.insert(QStringLiteral("memoryUsed"), clampPercent(memTotal));
+    cpu.insert(QStringLiteral("memoryTotal"), 100);
+    devices.push_front(cpu);
+
+    if (devices.isEmpty())
+        seedResourceSnapshot(QStringLiteral("未解析到远端资源，显示示例快照"));
+    else {
+        m_resourceDevices = devices;
+        m_resourceProcesses = processes;
+        m_resourceJobs = jobs;
+        m_resourceDisks = disks;
+        rebuildResourceProcessGroups();
+        m_resourceSnapshotText =
+            QStringLiteral("快照：%1").arg(QDateTime::currentDateTime().toString("HH:mm:ss"));
+        m_resourceSnapshotBusy = false;
+        emit resourceSnapshotChanged();
+    }
+}
+
+void AppController::captureResourceOutput(const QByteArray &data) {
+    if (!m_resourceSnapshotBusy && !QString::fromUtf8(data).contains(
+                                       QStringLiteral("__RSSH_RESOURCE_BEGIN__"))) {
+        return;
+    }
+
+    m_resourceCapture.append(QString::fromUtf8(data));
+    if (m_resourceCapture.size() > 50000) {
+        m_resourceSnapshotBusy = false;
+        m_resourceSnapshotText = QStringLiteral("资源快照过长，已停止解析");
+        m_resourceCapture.clear();
+        emit resourceSnapshotChanged();
+        return;
+    }
+    if (m_resourceCapture.contains(QStringLiteral("__RSSH_RESOURCE_END__"))) {
+        const QString captured = m_resourceCapture;
+        m_resourceCapture.clear();
+        parseResourceSnapshot(captured);
+    }
+}
+
+void AppController::rebuildResourceProcessGroups() {
+    QHash<QString, QVariantList> buckets;
+    QHash<QString, double> cpuTotals;
+    QHash<QString, int> memoryTotals;
+
+    for (const QVariant &value : m_resourceProcesses) {
+        const QVariantMap process = value.toMap();
+        QString device = process.value(QStringLiteral("device")).toString();
+        if (device.isEmpty())
+            device = QStringLiteral("CPU");
+        buckets[device].push_back(process);
+        cpuTotals[device] += process.value(QStringLiteral("cpu")).toDouble();
+        memoryTotals[device] += process.value(QStringLiteral("gpuMemory")).toInt();
+    }
+
+    QVariantList groups;
+    auto appendGroup = [&](const QString &device) {
+        if (!buckets.contains(device))
+            return;
+        QVariantMap group;
+        group.insert(QStringLiteral("device"), device);
+        group.insert(QStringLiteral("processes"), buckets.value(device));
+        group.insert(QStringLiteral("count"), buckets.value(device).size());
+        group.insert(QStringLiteral("cpu"), clampPercent(cpuTotals.value(device)));
+        group.insert(QStringLiteral("gpuMemory"), memoryTotals.value(device));
+        groups.push_back(group);
+    };
+
+    appendGroup(QStringLiteral("CPU"));
+    const auto keys = buckets.keys();
+    for (const QString &device : keys) {
+        if (device != QStringLiteral("CPU"))
+            appendGroup(device);
+    }
+    m_resourceProcessGroups = groups;
 }
 
 void AppController::trackFsRequest(quint64 requestId, const PendingFs &pending) {

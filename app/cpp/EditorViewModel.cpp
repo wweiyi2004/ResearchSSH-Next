@@ -24,12 +24,22 @@ void EditorViewModel::setContent(const QString &path, const QByteArray &data) {
     m_isOpen = true;
     m_saving = false;
     emit changed();
-    emit contentLoaded(QString::fromUtf8(data));
+    emit contentLoaded(path, QString::fromUtf8(data));
 }
 
 void EditorViewModel::failOpen() {
     m_path.clear();
     m_isOpen = false;
+    m_busy = false;
+    m_saving = false;
+    emit changed();
+}
+
+void EditorViewModel::activatePath(const QString &path) {
+    if (path.isEmpty())
+        return;
+    m_path = path;
+    m_isOpen = true;
     m_busy = false;
     m_saving = false;
     emit changed();
