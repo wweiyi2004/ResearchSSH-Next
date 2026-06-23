@@ -33,6 +33,18 @@ Dialog {
         hostField.forceActiveFocus()
     }
 
+    function localPathFromFileUrl(fileUrl) {
+        var text = String(fileUrl)
+        if (text.indexOf("file://") !== 0)
+            return decodeURIComponent(text)
+        if (Qt.platform.os === "windows") {
+            if (text.indexOf("file:///") === 0)
+                return decodeURIComponent(text.slice(8))
+            return "\\\\" + decodeURIComponent(text.slice(7)).replace(/\//g, "\\")
+        }
+        return decodeURIComponent(text.slice(7))
+    }
+
     contentItem: ColumnLayout {
         spacing: 12
         // Header
@@ -170,6 +182,6 @@ Dialog {
     FileDialog {
         id: keyFileDialog
         title: "选择私钥文件"
-        onAccepted: keyPathField.text = selectedFile.toString().replace("file:///", "")
+        onAccepted: keyPathField.text = dialog.localPathFromFileUrl(selectedFile)
     }
 }

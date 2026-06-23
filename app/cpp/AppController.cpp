@@ -12,6 +12,8 @@ namespace researchssh {
 namespace {
 
 constexpr quint64 kEditorReadLimit = 2 * 1024 * 1024;
+constexpr auto kResourceBegin = "__RSSH_RESOURCE_BEGIN__";
+constexpr auto kResourceEnd = "__RSSH_RESOURCE_END__";
 
 QString baseNameOf(const QString &path) {
     const QString trimmed = path.endsWith('/') && path.size() > 1 ? path.left(path.size() - 1)
@@ -71,6 +73,42 @@ int clampPercent(double value) {
     if (value > 100.0)
         return 100;
     return static_cast<int>(value + 0.5);
+}
+
+bool lineEqualsMarker(const QString &line, const char *marker) {
+    return line.trimmed() == QString::fromLatin1(marker);
+}
+
+bool containsMarkerLine(const QString &text, const char *marker) {
+    const QStringList lines = text.split(QRegularExpression(QStringLiteral("[\\r\\n]+")));
+    for (const QString &line : lines) {
+        if (lineEqualsMarker(line, marker))
+            return true;
+    }
+    return false;
+}
+
+bool extractMarkedBody(const QString &text, QString *body) {
+    QStringList bodyLines;
+    bool inBody = false;
+    const QStringList lines = text.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
+                                         Qt::KeepEmptyParts);
+    for (const QString &line : lines) {
+        if (!inBody) {
+            if (lineEqualsMarker(line, kResourceBegin)) {
+                inBody = true;
+                bodyLines.clear();
+            }
+            continue;
+        }
+        if (lineEqualsMarker(line, kResourceEnd)) {
+            if (body)
+                *body = bodyLines.join(QLatin1Char('\n'));
+            return true;
+        }
+        bodyLines.push_back(line);
+    }
+    return false;
 }
 
 } // namespace
@@ -284,6 +322,7 @@ void AppController::refreshResourceSnapshot() {
 
     m_resourceSnapshotBusy = true;
     m_resourceCapture.clear();
+    m_resourceMarkerTail.clear();
     m_resourceSnapshotText = QStringLiteral("正在采集远端资源快照...");
     emit resourceSnapshotChanged();
 
@@ -369,7 +408,7 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
                     }
                 }
             } else if (pending.kind == PendingFs::EditorOpen) {
-                m_editor->failOpen();
+                m_editor->failOpen(pending.path, result.message);
             }
 
             const QString msg =
@@ -377,7 +416,7 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
                     ? RustCoreBridge::describe(static_cast<RsErrorCode>(result.errorCode))
                     : result.message;
             if (pending.kind == PendingFs::EditorSave)
-                m_editor->finishSave(false, msg);
+                m_editor->finishSave(false, msg, pending.path);
             m_terminal->appendNotice(QStringLiteral("文件操作失败：%1").arg(msg));
             continue;
         }
@@ -402,14 +441,14 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
         case PendingFs::EditorOpen:
             if (result.kind == RsFsResultKind_Content) {
                 if (static_cast<quint64>(result.data.size()) >= kEditorReadLimit) {
-                    m_editor->failOpen();
+                    m_editor->failOpen(pending.path, QStringLiteral("文件达到编辑器读取上限。"));
                     m_terminal->appendNotice(QStringLiteral(
                         "拒绝打开：文件达到编辑器读取上限 %1 MB。")
                                                 .arg(kEditorReadLimit / 1024 / 1024));
                     break;
                 }
                 if (!looksLikeTextBuffer(result.data)) {
-                    m_editor->failOpen();
+                    m_editor->failOpen(pending.path, QStringLiteral("该文件看起来不是 UTF-8 文本。"));
                     m_terminal->appendNotice(
                         QStringLiteral("拒绝打开：该文件看起来不是 UTF-8 文本。"));
                     break;
@@ -417,13 +456,13 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
                 m_editor->setContent(pending.path, result.data);
                 m_terminal->appendNotice(QStringLiteral("已打开远端文件：%1").arg(pending.path));
             } else {
-                m_editor->failOpen();
+                m_editor->failOpen(pending.path, QStringLiteral("返回结果类型不匹配。"));
                 m_terminal->appendNotice(QStringLiteral("打开文件失败：返回结果类型不匹配。"));
             }
             break;
         case PendingFs::EditorSave:
             if (result.kind == RsFsResultKind_Ok) {
-                m_editor->finishSave(true);
+                m_editor->finishSave(true, {}, pending.path);
                 m_terminal->appendNotice(QStringLiteral("已保存远端文件：%1").arg(pending.path));
                 if (!pending.refreshDir.isNull())
                     expandDir(pending.refreshDir);
@@ -432,7 +471,8 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
             } else {
                 // Any non-Ok, non-Error result is unexpected for a write; fail the
                 // save so the editor doesn't stay stuck in the "saving" state.
-                m_editor->finishSave(false, QStringLiteral("保存失败：返回结果类型不匹配。"));
+                m_editor->finishSave(false, QStringLiteral("保存失败：返回结果类型不匹配。"),
+                                     pending.path);
                 m_terminal->appendNotice(QStringLiteral("保存失败：返回结果类型不匹配。"));
             }
             break;
@@ -440,7 +480,7 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
             if (result.kind == RsFsResultKind_Ok) {
                 m_terminal->appendNotice(QStringLiteral("文件操作完成。"));
                 if (pending.path == m_editor->path())
-                    m_editor->close();
+                    m_editor->closePath(pending.path);
                 if (pending.clearClipboard) {
                     m_clipboardPath.clear();
                     m_clipboardCut = false;
@@ -467,7 +507,7 @@ void AppController::openPath(const QString &path) {
     m_editor->beginOpen(path);
     const quint64 id = m_bridge.fsRead(m_session, path, kEditorReadLimit);
     if (id == 0) {
-        m_editor->failOpen();
+        m_editor->failOpen(path, QStringLiteral("无法提交读取请求。"));
         m_terminal->appendNotice(QStringLiteral("无法提交读取请求。"));
         return;
     }
@@ -639,7 +679,7 @@ void AppController::saveEditor(const QString &text) {
     m_editor->beginSave();
     const quint64 id = m_bridge.fsWrite(m_session, path, text.toUtf8());
     if (id == 0) {
-        m_editor->finishSave(false, QStringLiteral("无法提交保存请求。"));
+        m_editor->finishSave(false, QStringLiteral("无法提交保存请求。"), path);
         m_terminal->appendNotice(QStringLiteral("无法提交保存请求。"));
         return;
     }
@@ -827,9 +867,8 @@ void AppController::seedResourceSnapshot(const QString &statusText) {
 }
 
 void AppController::parseResourceSnapshot(const QString &text) {
-    const int begin = text.indexOf(QStringLiteral("__RSSH_RESOURCE_BEGIN__"));
-    const int end = text.indexOf(QStringLiteral("__RSSH_RESOURCE_END__"));
-    if (begin < 0 || end <= begin) {
+    QString body;
+    if (!extractMarkedBody(text, &body)) {
         m_resourceSnapshotBusy = false;
         m_resourceSnapshotText = QStringLiteral("资源快照解析失败：未找到完整标记");
         emit resourceSnapshotChanged();
@@ -846,8 +885,6 @@ void AppController::parseResourceSnapshot(const QString &text) {
     double memTotal = 0.0;
     QHash<QString, QString> gpuUuidToLabel;
 
-    const int bodyStart = begin + QStringLiteral("__RSSH_RESOURCE_BEGIN__").size();
-    const QString body = text.mid(bodyStart, end - bodyStart);
     const QStringList lines = body.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
                                          Qt::SkipEmptyParts);
     const QRegularExpression cpuLine(
@@ -883,13 +920,20 @@ void AppController::parseResourceSnapshot(const QString &text) {
             bool okUtil = false;
             bool okUsed = false;
             bool okTotal = false;
-            const bool hasUuid = parts.size() >= 6;
+            const bool hasUuid =
+                parts.size() >= 6 && parts.at(1).trimmed().startsWith(QStringLiteral("GPU-"));
+            const int size = parts.size();
             const QString index = parts.at(0).trimmed();
             const QString uuid = hasUuid ? parts.at(1).trimmed() : QString();
-            const QString name = parts.at(hasUuid ? 2 : 1).trimmed();
-            const int util = parts.at(hasUuid ? 3 : 2).trimmed().toInt(&okUtil);
-            const int used = parts.at(hasUuid ? 4 : 3).trimmed().toInt(&okUsed);
-            const int total = parts.at(hasUuid ? 5 : 4).trimmed().toInt(&okTotal);
+            const int nameStart = hasUuid ? 2 : 1;
+            const int nameEndExclusive = size - 3;
+            QStringList nameParts;
+            for (int i = nameStart; i < nameEndExclusive; ++i)
+                nameParts.push_back(parts.at(i).trimmed());
+            const QString name = nameParts.join(QStringLiteral(", "));
+            const int util = parts.at(size - 3).trimmed().toInt(&okUtil);
+            const int used = parts.at(size - 2).trimmed().toInt(&okUsed);
+            const int total = parts.at(size - 1).trimmed().toInt(&okTotal);
             if (!okUtil || !okUsed || !okTotal)
                 continue;
             const QString label = QStringLiteral("GPU %1").arg(index);
@@ -909,12 +953,17 @@ void AppController::parseResourceSnapshot(const QString &text) {
                 continue;
             bool okMem = false;
             const bool hasDevice = parts.size() >= 4;
+            const int size = parts.size();
             QString device = hasDevice ? parts.at(0).trimmed() : QStringLiteral("GPU");
             device = gpuUuidToLabel.value(device, device);
             const QString pid = hasDevice ? parts.at(1).trimmed() : parts.at(0).trimmed();
-            const QString name = hasDevice ? parts.at(2).trimmed() : parts.at(1).trimmed();
-            const int gpuMem =
-                (hasDevice ? parts.at(3).trimmed() : parts.at(2).trimmed()).toInt(&okMem);
+            const int nameStart = hasDevice ? 2 : 1;
+            const int nameEndExclusive = size - 1;
+            QStringList nameParts;
+            for (int i = nameStart; i < nameEndExclusive; ++i)
+                nameParts.push_back(parts.at(i).trimmed());
+            const QString name = nameParts.join(QStringLiteral(", "));
+            const int gpuMem = parts.at(size - 1).trimmed().toInt(&okMem);
             QVariantMap proc;
             proc.insert(QStringLiteral("pid"), pid);
             proc.insert(QStringLiteral("user"), QStringLiteral("-"));
@@ -1003,22 +1052,37 @@ void AppController::parseResourceSnapshot(const QString &text) {
 }
 
 void AppController::captureResourceOutput(const QByteArray &data) {
-    if (!m_resourceSnapshotBusy && !QString::fromUtf8(data).contains(
-                                       QStringLiteral("__RSSH_RESOURCE_BEGIN__"))) {
+    const QString chunk = QString::fromUtf8(data);
+    QString captureChunk = chunk;
+    if (!m_resourceSnapshotBusy) {
+        const QString probe = m_resourceMarkerTail + chunk;
+        if (!containsMarkerLine(probe, kResourceBegin)) {
+            m_resourceMarkerTail = probe.right(QString::fromLatin1(kResourceBegin).size() + 2);
+            return;
+        }
+        captureChunk = probe;
+        m_resourceMarkerTail.clear();
+        m_resourceSnapshotBusy = true;
+    }
+
+    m_resourceCapture.append(captureChunk);
+    if (!containsMarkerLine(m_resourceCapture, kResourceBegin)) {
+        m_resourceCapture = m_resourceCapture.right(QString::fromLatin1(kResourceBegin).size() + 2);
         return;
     }
 
-    m_resourceCapture.append(QString::fromUtf8(data));
     if (m_resourceCapture.size() > 50000) {
         m_resourceSnapshotBusy = false;
         m_resourceSnapshotText = QStringLiteral("资源快照过长，已停止解析");
         m_resourceCapture.clear();
+        m_resourceMarkerTail.clear();
         emit resourceSnapshotChanged();
         return;
     }
-    if (m_resourceCapture.contains(QStringLiteral("__RSSH_RESOURCE_END__"))) {
+    if (extractMarkedBody(m_resourceCapture, nullptr)) {
         const QString captured = m_resourceCapture;
         m_resourceCapture.clear();
+        m_resourceMarkerTail.clear();
         parseResourceSnapshot(captured);
     }
 }

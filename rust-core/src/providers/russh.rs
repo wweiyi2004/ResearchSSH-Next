@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 use russh::client::{self, Handle};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
@@ -123,29 +124,65 @@ fn connect_err(stage: &str, e: impl std::fmt::Display) -> CoreError {
     CoreError::with_detail(RsErrorCode::ConnectFailed, format!("{stage}: {e}"))
 }
 
+#[derive(Debug, Default)]
+struct PublicKeyAuthReport {
+    authenticated: bool,
+    attempted: usize,
+    fatal_load_error: bool,
+    last_error: Option<String>,
+}
+
 /// Try public-key auth against `session` for every candidate key, in order.
-/// Returns `true` on the first key the server accepts. Per-key load/auth failures
-/// are swallowed so the next candidate is tried; the caller falls back to password.
+/// Auto-discovered key load/auth failures are recorded and the next candidate is
+/// tried. An explicit key load failure is fatal so users see path/passphrase
+/// problems instead of silently falling back to password auth.
 async fn try_publickey_auth(
     session: &mut Handle<ClientHandler>,
     username: &str,
     candidates: &[PathBuf],
     passphrase: Option<&str>,
-) -> bool {
+    explicit_key: bool,
+) -> PublicKeyAuthReport {
+    let mut report = PublicKeyAuthReport::default();
     for path in candidates {
+        report.attempted += 1;
         let key: PrivateKey = match russh::keys::load_secret_key(path, passphrase) {
             Ok(k) => k,
-            Err(_) => continue, // wrong passphrase / unreadable / unparseable
+            Err(e) => {
+                report.last_error = Some(format!(
+                    "private key load failed for {}: {e}",
+                    path.display()
+                ));
+                if explicit_key {
+                    report.fatal_load_error = true;
+                    break;
+                }
+                continue;
+            }
         };
         // For non-RSA keys `new` resets the hash to None; Some(Sha256) is the
         // correct choice for RSA (rsa-sha2-256).
         let kwh = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
         match session.authenticate_publickey(username, kwh).await {
-            Ok(result) if result.success() => return true,
-            _ => continue,
+            Ok(result) if result.success() => {
+                report.authenticated = true;
+                return report;
+            }
+            Ok(_) => {
+                report.last_error = Some(format!(
+                    "public-key authentication rejected for {}",
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                report.last_error = Some(format!(
+                    "public-key authentication failed for {}: {e}",
+                    path.display()
+                ));
+            }
         }
     }
-    false
+    report
 }
 
 #[async_trait]
@@ -184,43 +221,58 @@ impl SshProvider for RusshProvider {
         .map_err(|e| connect_err("connect", e))?;
 
         // Public-key first: an explicit key path overrides auto-discovery.
+        let explicit_key = self.key_path.is_some();
         let candidates: Vec<PathBuf> = match &self.key_path {
             Some(p) => vec![PathBuf::from(p)],
             None => default_ssh_dir()
                 .map(|d| keys_in_dir(&d))
                 .unwrap_or_default(),
         };
-        let passphrase: Option<String> = match &self.key_passphrase {
-            Some(s) => Some(String::from_utf8(s.expose().to_vec()).map_err(|_| {
-                CoreError::with_detail(
-                    RsErrorCode::ConnectFailed,
-                    "key passphrase is not valid UTF-8",
-                )
-            })?),
+        let passphrase: Option<Zeroizing<String>> = match &self.key_passphrase {
+            Some(s) => Some(Zeroizing::new(
+                String::from_utf8(s.expose().to_vec()).map_err(|_| {
+                    CoreError::with_detail(
+                        RsErrorCode::ConnectFailed,
+                        "key passphrase is not valid UTF-8",
+                    )
+                })?,
+            )),
             None => None,
         };
         let mut authenticated = false;
+        let mut key_auth = PublicKeyAuthReport::default();
         if !candidates.is_empty() {
-            authenticated = try_publickey_auth(
+            key_auth = try_publickey_auth(
                 &mut session,
                 &self.config.username,
                 &candidates,
-                passphrase.as_deref(),
+                passphrase.as_ref().map(|s| s.as_str()),
+                explicit_key,
             )
             .await;
+            authenticated = key_auth.authenticated;
+            if key_auth.fatal_load_error {
+                return Err(CoreError::with_detail(
+                    RsErrorCode::ConnectFailed,
+                    key_auth
+                        .last_error
+                        .unwrap_or_else(|| "private key load failed".to_string()),
+                ));
+            }
         }
 
         // Fall back to password auth if public key did not succeed.
         if !authenticated {
             if let Some(secret) = &self.secret {
-                let password = String::from_utf8(secret.expose().to_vec()).map_err(|_| {
-                    CoreError::with_detail(
-                        RsErrorCode::ConnectFailed,
-                        "password is not valid UTF-8",
-                    )
-                })?;
+                let password =
+                    Zeroizing::new(String::from_utf8(secret.expose().to_vec()).map_err(|_| {
+                        CoreError::with_detail(
+                            RsErrorCode::ConnectFailed,
+                            "password is not valid UTF-8",
+                        )
+                    })?);
                 let auth = session
-                    .authenticate_password(&self.config.username, password)
+                    .authenticate_password(&self.config.username, password.as_str())
                     .await
                     .map_err(|e| connect_err("auth", e))?;
                 authenticated = auth.success();
@@ -228,10 +280,20 @@ impl SshProvider for RusshProvider {
         }
 
         if !authenticated {
-            let detail = if candidates.is_empty() && self.secret.is_none() {
-                "no usable key or password"
-            } else {
-                "authentication failed (public-key and password)"
+            let tried_publickey = key_auth.attempted > 0;
+            let tried_password = self.secret.is_some();
+            let detail = match (tried_publickey, tried_password) {
+                (false, false) => "no usable key or password".to_string(),
+                (true, false) => key_auth
+                    .last_error
+                    .unwrap_or_else(|| "authentication failed (public-key)".to_string()),
+                (false, true) => "authentication failed (password)".to_string(),
+                (true, true) => match key_auth.last_error {
+                    Some(error) => {
+                        format!("authentication failed (public-key: {error}; password)")
+                    }
+                    None => "authentication failed (public-key and password)".to_string(),
+                },
             };
             return Err(CoreError::with_detail(RsErrorCode::ConnectFailed, detail));
         }
@@ -675,13 +737,46 @@ mod e2e {
     use crate::RsErrorCode;
     use russh::keys::ssh_key::LineEnding;
     use russh::keys::{PrivateKey, PublicKey};
-    use std::ffi::{c_void, CString};
+    use std::ffi::{c_void, CString, OsString};
+    use std::path::Path;
     use std::sync::atomic::{AtomicPtr, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
     use russh::server::{self, Auth, Msg, Server as _, Session};
     use russh::{Channel, ChannelId, Pty};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        userprofile: Option<OsString>,
+        home: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_home(path: &Path) -> Self {
+            let guard = Self {
+                userprofile: std::env::var_os("USERPROFILE"),
+                home: std::env::var_os("HOME"),
+            };
+            std::env::set_var("USERPROFILE", path);
+            std::env::set_var("HOME", path);
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            match &self.home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
 
     // ----- in-process test server -----
     struct Srv {
@@ -799,11 +894,11 @@ mod e2e {
 
     #[test]
     fn russh_provider_real_handshake_over_loopback() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
         // Keep known_hosts writes out of the real ~/.ssh during the test.
         let tmp = std::env::temp_dir().join(format!("rssh_e2e_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("USERPROFILE", &tmp);
-        std::env::set_var("HOME", &tmp);
+        let _env_guard = EnvGuard::set_home(&tmp);
 
         // Start the in-process SSH server on an ephemeral loopback port.
         let server_rt = tokio::runtime::Runtime::new().unwrap();
@@ -888,10 +983,10 @@ mod e2e {
 
     #[test]
     fn russh_provider_publickey_auth_over_loopback() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("rssh_pk_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("USERPROFILE", &tmp);
-        std::env::set_var("HOME", &tmp);
+        let _env_guard = EnvGuard::set_home(&tmp);
 
         // Client key pair; the server will trust the public half.
         let client_key =
