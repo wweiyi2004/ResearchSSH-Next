@@ -12,6 +12,8 @@ namespace researchssh {
 namespace {
 
 constexpr quint64 kEditorReadLimit = 2 * 1024 * 1024;
+constexpr auto kResourceBegin = "__RSSH_RESOURCE_BEGIN__";
+constexpr auto kResourceEnd = "__RSSH_RESOURCE_END__";
 
 QString baseNameOf(const QString &path) {
     const QString trimmed = path.endsWith('/') && path.size() > 1 ? path.left(path.size() - 1)
@@ -71,6 +73,42 @@ int clampPercent(double value) {
     if (value > 100.0)
         return 100;
     return static_cast<int>(value + 0.5);
+}
+
+bool lineEqualsMarker(const QString &line, const char *marker) {
+    return line.trimmed() == QString::fromLatin1(marker);
+}
+
+bool containsMarkerLine(const QString &text, const char *marker) {
+    const QStringList lines = text.split(QRegularExpression(QStringLiteral("[\\r\\n]+")));
+    for (const QString &line : lines) {
+        if (lineEqualsMarker(line, marker))
+            return true;
+    }
+    return false;
+}
+
+bool extractMarkedBody(const QString &text, QString *body) {
+    QStringList bodyLines;
+    bool inBody = false;
+    const QStringList lines = text.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
+                                         Qt::KeepEmptyParts);
+    for (const QString &line : lines) {
+        if (!inBody) {
+            if (lineEqualsMarker(line, kResourceBegin)) {
+                inBody = true;
+                bodyLines.clear();
+            }
+            continue;
+        }
+        if (lineEqualsMarker(line, kResourceEnd)) {
+            if (body)
+                *body = bodyLines.join(QLatin1Char('\n'));
+            return true;
+        }
+        bodyLines.push_back(line);
+    }
+    return false;
 }
 
 } // namespace
@@ -828,9 +866,8 @@ void AppController::seedResourceSnapshot(const QString &statusText) {
 }
 
 void AppController::parseResourceSnapshot(const QString &text) {
-    const int begin = text.indexOf(QStringLiteral("__RSSH_RESOURCE_BEGIN__"));
-    const int end = text.indexOf(QStringLiteral("__RSSH_RESOURCE_END__"));
-    if (begin < 0 || end <= begin) {
+    QString body;
+    if (!extractMarkedBody(text, &body)) {
         m_resourceSnapshotBusy = false;
         m_resourceSnapshotText = QStringLiteral("资源快照解析失败：未找到完整标记");
         emit resourceSnapshotChanged();
@@ -847,8 +884,6 @@ void AppController::parseResourceSnapshot(const QString &text) {
     double memTotal = 0.0;
     QHash<QString, QString> gpuUuidToLabel;
 
-    const int bodyStart = begin + QStringLiteral("__RSSH_RESOURCE_BEGIN__").size();
-    const QString body = text.mid(bodyStart, end - bodyStart);
     const QStringList lines = body.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
                                          Qt::SkipEmptyParts);
     const QRegularExpression cpuLine(
@@ -1004,12 +1039,12 @@ void AppController::parseResourceSnapshot(const QString &text) {
 }
 
 void AppController::captureResourceOutput(const QByteArray &data) {
-    if (!m_resourceSnapshotBusy && !QString::fromUtf8(data).contains(
-                                       QStringLiteral("__RSSH_RESOURCE_BEGIN__"))) {
+    const QString chunk = QString::fromUtf8(data);
+    if (!m_resourceSnapshotBusy && !containsMarkerLine(chunk, kResourceBegin)) {
         return;
     }
 
-    m_resourceCapture.append(QString::fromUtf8(data));
+    m_resourceCapture.append(chunk);
     if (m_resourceCapture.size() > 50000) {
         m_resourceSnapshotBusy = false;
         m_resourceSnapshotText = QStringLiteral("资源快照过长，已停止解析");
@@ -1017,7 +1052,7 @@ void AppController::captureResourceOutput(const QByteArray &data) {
         emit resourceSnapshotChanged();
         return;
     }
-    if (m_resourceCapture.contains(QStringLiteral("__RSSH_RESOURCE_END__"))) {
+    if (extractMarkedBody(m_resourceCapture, nullptr)) {
         const QString captured = m_resourceCapture;
         m_resourceCapture.clear();
         parseResourceSnapshot(captured);
