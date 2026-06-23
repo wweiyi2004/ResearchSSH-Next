@@ -12,6 +12,7 @@ use crate::secret::Secret;
 use crate::session::HostKeyGate;
 use crate::{CoreError, CoreResult, RsErrorCode};
 use async_trait::async_trait;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -344,6 +345,23 @@ fn join_path(dir: &str, name: &str) -> String {
     format!("{}/{}", dir.trim_end_matches('/'), name)
 }
 
+/// The user's ~/.ssh directory from USERPROFILE (Windows) or HOME, if set.
+fn default_ssh_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|home| PathBuf::from(home).join(".ssh"))
+}
+
+/// Default OpenSSH identity files in `ssh_dir` that actually exist, in OpenSSH
+/// preference order (modern algorithms first).
+fn keys_in_dir(ssh_dir: &Path) -> Vec<PathBuf> {
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .iter()
+        .map(|name| ssh_dir.join(name))
+        .filter(|p| p.is_file())
+        .collect()
+}
+
 /// Classify an SFTP entry, distinguishing symlinks from real directories/files.
 /// Whether `meta` came from STAT or LSTAT determines whether a symlink shows up as
 /// `Symlink` (LSTAT, the link itself) or as its target's kind (STAT, followed).
@@ -511,6 +529,29 @@ impl FileProvider for SftpFileProvider {
             .write(to, &data)
             .await
             .map_err(|e| sftp_err("copy write", e))
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn keys_in_dir_returns_existing_in_preference_order() {
+        let dir = std::env::temp_dir().join(format!("rssh_disc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create id_rsa and id_ed25519 but NOT id_ecdsa.
+        std::fs::write(dir.join("id_rsa"), b"x").unwrap();
+        std::fs::write(dir.join("id_ed25519"), b"x").unwrap();
+
+        let found = keys_in_dir(&dir);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["id_ed25519".to_string(), "id_rsa".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
