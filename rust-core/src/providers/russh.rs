@@ -12,12 +12,13 @@ use crate::secret::Secret;
 use crate::session::HostKeyGate;
 use crate::{CoreError, CoreResult, RsErrorCode};
 use async_trait::async_trait;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 use russh::client::{self, Handle};
-use russh::keys::{HashAlg, PublicKey};
+use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::Disconnect;
 use russh_sftp::client::SftpSession;
 
@@ -92,6 +93,8 @@ fn learn_known_hosts(host: &str, port: u16, key: &PublicKey) -> std::io::Result<
 pub struct RusshProvider {
     config: ConnectionConfig,
     secret: Option<Secret>,
+    key_path: Option<String>,
+    key_passphrase: Option<Secret>,
     gate: Option<HostKeyGate>,
     session: Option<Handle<ClientHandler>>,
     writer: Option<Box<dyn AsyncWrite + Send + Unpin>>,
@@ -105,6 +108,8 @@ impl RusshProvider {
         Self {
             config,
             secret: None,
+            key_path: None,
+            key_passphrase: None,
             gate: None,
             session: None,
             writer: None,
@@ -118,10 +123,40 @@ fn connect_err(stage: &str, e: impl std::fmt::Display) -> CoreError {
     CoreError::with_detail(RsErrorCode::ConnectFailed, format!("{stage}: {e}"))
 }
 
+/// Try public-key auth against `session` for every candidate key, in order.
+/// Returns `true` on the first key the server accepts. Per-key load/auth failures
+/// are swallowed so the next candidate is tried; the caller falls back to password.
+async fn try_publickey_auth(
+    session: &mut Handle<ClientHandler>,
+    username: &str,
+    candidates: &[PathBuf],
+    passphrase: Option<&str>,
+) -> bool {
+    for path in candidates {
+        let key: PrivateKey = match russh::keys::load_secret_key(path, passphrase) {
+            Ok(k) => k,
+            Err(_) => continue, // wrong passphrase / unreadable / unparseable
+        };
+        // For non-RSA keys `new` resets the hash to None; Some(Sha256) is the
+        // correct choice for RSA (rsa-sha2-256).
+        let kwh = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
+        match session.authenticate_publickey(username, kwh).await {
+            Ok(result) if result.success() => return true,
+            _ => continue,
+        }
+    }
+    false
+}
+
 #[async_trait]
 impl SshProvider for RusshProvider {
     fn set_secret(&mut self, secret: Secret) {
         self.secret = Some(secret);
+    }
+
+    fn set_private_key(&mut self, key_path: Option<String>, passphrase: Option<Secret>) {
+        self.key_path = key_path;
+        self.key_passphrase = passphrase;
     }
 
     fn set_host_key_gate(&mut self, gate: HostKeyGate) {
@@ -148,32 +183,57 @@ impl SshProvider for RusshProvider {
         .await
         .map_err(|e| connect_err("connect", e))?;
 
-        // Password authentication (the only method wired in this step). Require
-        // valid UTF-8 rather than silently lossy-replacing bytes: a mangled password
-        // would just fail auth with a confusing error, and `russh` needs a `String`.
-        let password = match &self.secret {
-            Some(secret) => String::from_utf8(secret.expose().to_vec()).map_err(|_| {
+        // Public-key first: an explicit key path overrides auto-discovery.
+        let candidates: Vec<PathBuf> = match &self.key_path {
+            Some(p) => vec![PathBuf::from(p)],
+            None => default_ssh_dir()
+                .map(|d| keys_in_dir(&d))
+                .unwrap_or_default(),
+        };
+        let passphrase: Option<String> = match &self.key_passphrase {
+            Some(s) => Some(String::from_utf8(s.expose().to_vec()).map_err(|_| {
                 CoreError::with_detail(
                     RsErrorCode::ConnectFailed,
-                    "password is not valid UTF-8",
+                    "key passphrase is not valid UTF-8",
                 )
-            })?,
-            None => {
-                return Err(CoreError::with_detail(
-                    RsErrorCode::ConnectFailed,
-                    "no password set (public-key auth not wired yet)",
-                ))
-            }
+            })?),
+            None => None,
         };
-        let auth = session
-            .authenticate_password(&self.config.username, password)
-            .await
-            .map_err(|e| connect_err("auth", e))?;
-        if !auth.success() {
-            return Err(CoreError::with_detail(
-                RsErrorCode::ConnectFailed,
-                "authentication failed",
-            ));
+        let mut authenticated = false;
+        if !candidates.is_empty() {
+            authenticated = try_publickey_auth(
+                &mut session,
+                &self.config.username,
+                &candidates,
+                passphrase.as_deref(),
+            )
+            .await;
+        }
+
+        // Fall back to password auth if public key did not succeed.
+        if !authenticated {
+            if let Some(secret) = &self.secret {
+                let password = String::from_utf8(secret.expose().to_vec()).map_err(|_| {
+                    CoreError::with_detail(
+                        RsErrorCode::ConnectFailed,
+                        "password is not valid UTF-8",
+                    )
+                })?;
+                let auth = session
+                    .authenticate_password(&self.config.username, password)
+                    .await
+                    .map_err(|e| connect_err("auth", e))?;
+                authenticated = auth.success();
+            }
+        }
+
+        if !authenticated {
+            let detail = if candidates.is_empty() && self.secret.is_none() {
+                "no usable key or password"
+            } else {
+                "authentication failed (public-key and password)"
+            };
+            return Err(CoreError::with_detail(RsErrorCode::ConnectFailed, detail));
         }
 
         // Open a session channel and request an interactive PTY + shell.
@@ -342,6 +402,23 @@ fn sftp_err(stage: &str, e: impl std::fmt::Display) -> CoreError {
 
 fn join_path(dir: &str, name: &str) -> String {
     format!("{}/{}", dir.trim_end_matches('/'), name)
+}
+
+/// The user's ~/.ssh directory from USERPROFILE (Windows) or HOME, if set.
+fn default_ssh_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|home| PathBuf::from(home).join(".ssh"))
+}
+
+/// Default OpenSSH identity files in `ssh_dir` that actually exist, in OpenSSH
+/// preference order (modern algorithms first).
+fn keys_in_dir(ssh_dir: &Path) -> Vec<PathBuf> {
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .iter()
+        .map(|name| ssh_dir.join(name))
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 /// Classify an SFTP entry, distinguishing symlinks from real directories/files.
@@ -515,6 +592,29 @@ impl FileProvider for SftpFileProvider {
 }
 
 #[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn keys_in_dir_returns_existing_in_preference_order() {
+        let dir = std::env::temp_dir().join(format!("rssh_disc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create id_rsa and id_ed25519 but NOT id_ecdsa.
+        std::fs::write(dir.join("id_rsa"), b"x").unwrap();
+        std::fs::write(dir.join("id_ed25519"), b"x").unwrap();
+
+        let found = keys_in_dir(&dir);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["id_ed25519".to_string(), "id_rsa".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod kind_tests {
     use super::*;
     use russh_sftp::protocol::FileAttributes;
@@ -568,10 +668,13 @@ mod e2e {
     use crate::ffi::{
         rscore_create, rscore_destroy, rscore_session_confirm_host_key, rscore_session_connect,
         rscore_session_create, rscore_session_destroy, rscore_session_disconnect,
-        rscore_session_send, rscore_session_set_password, RsSession, RsSessionConfig,
+        rscore_session_send, rscore_session_set_password, rscore_session_set_private_key, RsSession,
+        RsSessionConfig,
     };
     use crate::provider::RsProviderKind;
     use crate::RsErrorCode;
+    use russh::keys::ssh_key::LineEnding;
+    use russh::keys::{PrivateKey, PublicKey};
     use std::ffi::{c_void, CString};
     use std::sync::atomic::{AtomicPtr, Ordering};
     use std::sync::Mutex;
@@ -581,15 +684,21 @@ mod e2e {
     use russh::{Channel, ChannelId, Pty};
 
     // ----- in-process test server -----
-    struct Srv;
+    struct Srv {
+        trusted: Option<PublicKey>,
+    }
     impl server::Server for Srv {
         type Handler = ShellHandler;
         fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> ShellHandler {
-            ShellHandler
+            ShellHandler {
+                trusted: self.trusted.clone(),
+            }
         }
     }
 
-    struct ShellHandler;
+    struct ShellHandler {
+        trusted: Option<PublicKey>,
+    }
     impl server::Handler for ShellHandler {
         type Error = russh::Error;
 
@@ -598,6 +707,17 @@ mod e2e {
                 Ok(Auth::Accept)
             } else {
                 Ok(Auth::reject())
+            }
+        }
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            key: &PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            match &self.trusted {
+                Some(t) if key == t => Ok(Auth::Accept),
+                _ => Ok(Auth::reject()),
             }
         }
 
@@ -700,7 +820,7 @@ mod e2e {
                 ..Default::default()
             });
             tokio::spawn(async move {
-                let mut srv = Srv;
+                let mut srv = Srv { trusted: None };
                 let _ = srv.run_on_socket(config, &listener).await;
             });
             port
@@ -763,6 +883,83 @@ mod e2e {
         assert!(text.contains("test SSH server"), "banner missing: {text:?}");
         assert!(text.contains("echo: hello"), "echo missing: {text:?}");
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn russh_provider_publickey_auth_over_loopback() {
+        let tmp = std::env::temp_dir().join(format!("rssh_pk_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("USERPROFILE", &tmp);
+        std::env::set_var("HOME", &tmp);
+
+        // Client key pair; the server will trust the public half.
+        let client_key =
+            PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).unwrap();
+        let trusted = client_key.public_key().clone();
+        let key_path = tmp.join("id_ed25519_test");
+        client_key
+            .write_openssh_file(&key_path, LineEnding::LF)
+            .unwrap();
+
+        let server_rt = tokio::runtime::Runtime::new().unwrap();
+        let port = server_rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0u16))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let host_key =
+                russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                    .unwrap();
+            let config = std::sync::Arc::new(server::Config {
+                keys: vec![host_key],
+                ..Default::default()
+            });
+            tokio::spawn(async move {
+                let mut srv = Srv {
+                    trusted: Some(trusted),
+                };
+                let _ = srv.run_on_socket(config, &listener).await;
+            });
+            port
+        });
+
+        let collector = Box::new(Collector::default());
+        let cptr = &*collector as *const Collector as *mut c_void;
+        let mut err = RsErrorCode::Internal;
+        let core = rscore_create(&mut err);
+        let host = CString::new("127.0.0.1").unwrap();
+        let user = CString::new("researcher").unwrap();
+        let config = RsSessionConfig {
+            host: host.as_ptr(),
+            port,
+            username: user.as_ptr(),
+            provider: RsProviderKind::Russh,
+        };
+        let session = rscore_session_create(core, &config, Some(collect), cptr, &mut err);
+        assert!(!session.is_null());
+        collector.session.store(session, Ordering::SeqCst);
+
+        // Explicit key path; no password set — authentication must use the key.
+        let key_path_c = CString::new(key_path.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(
+            rscore_session_set_private_key(session, key_path_c.as_ptr(), std::ptr::null(), 0),
+            RsErrorCode::Ok
+        );
+        assert_eq!(rscore_session_connect(session), RsErrorCode::Ok);
+        std::thread::sleep(Duration::from_millis(3200));
+        {
+            let states = collector.states.lock().unwrap();
+            assert!(
+                states.contains(&RsSessionState::Connected),
+                "expected Connected via public key, states={states:?}, errors={:?}",
+                collector.errors.lock().unwrap()
+            );
+        }
+        rscore_session_disconnect(session);
+        std::thread::sleep(Duration::from_millis(300));
+        rscore_session_destroy(session);
+        rscore_destroy(core);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

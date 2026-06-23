@@ -248,6 +248,16 @@ RsErrorCode rscore_session_confirm_host_key(RsSession *session, bool accept);
 // providers; the mock discards it.
 RsErrorCode rscore_session_set_password(RsSession *session, const uint8_t *data, uintptr_t len);
 
+// Supplies a private key for public-key authentication. `key_path` null or
+// empty means "auto-discover the user's ~/.ssh default keys". `passphrase`
+// null / `passphrase_len == 0` means the key has no passphrase; otherwise the
+// bytes are copied into a zeroizing buffer immediately. Symmetric with
+// [`rscore_session_set_password`].
+RsErrorCode rscore_session_set_private_key(RsSession *session,
+                                           const char *key_path,
+                                           const uint8_t *passphrase,
+                                           uintptr_t passphrase_len);
+
 // Registers the file-result callback for a session. Required before any
 // `rscore_session_fs_*` call delivers results.
 RsErrorCode rscore_session_set_file_callback(RsSession *session,

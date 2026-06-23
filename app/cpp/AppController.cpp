@@ -132,6 +132,12 @@ void AppController::connectToServer(int index) {
         const QByteArray secret = m_credentials->load(m_currentEndpoint);
         if (!secret.isEmpty())
             m_bridge.setSessionPassword(m_session, secret);
+
+        // Public-key auth: hand the (optional) key path + passphrase to the core.
+        // An empty path means auto-discover ~/.ssh defaults; the mock ignores this.
+        const QByteArray keyPass =
+            m_credentials->load(m_currentEndpoint + QStringLiteral("#keypass"));
+        m_bridge.setSessionPrivateKey(m_session, item.keyPath, keyPass);
     }
 
     m_terminal->appendNotice(QStringLiteral("正在连接 %1 …").arg(m_currentEndpoint));
@@ -142,21 +148,23 @@ void AppController::connectToServer(int index) {
 }
 
 void AppController::connectToHost(const QString &host, int port, const QString &username,
-                                  const QString &password, const QString &name) {
+                                  const QString &password, const QString &name,
+                                  const QString &keyPath, const QString &keyPassphrase) {
     if (host.isEmpty() || username.isEmpty()) {
         m_terminal->appendNotice(QStringLiteral("主机和用户名不能为空。"));
         return;
     }
     const quint16 p = port > 0 ? static_cast<quint16>(port) : 22;
-    const int index =
-        m_servers->addServer(name, host, p, username, static_cast<int>(RsProviderKind_Russh));
+    const int index = m_servers->addServer(name, host, p, username,
+                                           static_cast<int>(RsProviderKind_Russh), keyPath);
 
-    // Stash the password in the credential store keyed by endpoint; connectToServer
-    // loads it from there and hands it to the core. It never round-trips through QML.
-    if (!password.isEmpty()) {
-        const QString endpoint = QStringLiteral("%1@%2:%3").arg(username, host).arg(p);
+    // Stash secrets in the credential store keyed by endpoint; connectToServer loads
+    // them from there and hands them to the core. They never round-trip through QML.
+    const QString endpoint = QStringLiteral("%1@%2:%3").arg(username, host).arg(p);
+    if (!password.isEmpty())
         m_credentials->store(endpoint, password.toUtf8());
-    }
+    if (!keyPassphrase.isEmpty())
+        m_credentials->store(endpoint + QStringLiteral("#keypass"), keyPassphrase.toUtf8());
 
     connectToServer(index);
 }

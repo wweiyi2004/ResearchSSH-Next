@@ -91,6 +91,11 @@ public:
     // Rust). The mock discards it; the russh provider uses it for password auth.
     RsErrorCode setSessionPassword(RsSession *session, const QByteArray &secret);
 
+    // Hand the (optional) private-key path + passphrase to the session's provider.
+    // An empty keyPath means auto-discover ~/.ssh defaults. The mock ignores it.
+    RsErrorCode setSessionPrivateKey(RsSession *session, const QString &keyPath,
+                                     const QByteArray &passphrase);
+
     // Deliver the user's decision for a pending host-key prompt.
     RsErrorCode confirmHostKey(RsSession *session, bool accept);
 

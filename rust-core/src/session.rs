@@ -93,6 +93,10 @@ enum Command {
     Send(Vec<u8>),
     Disconnect,
     SetSecret(Secret),
+    SetPrivateKey {
+        key_path: Option<String>,
+        passphrase: Option<Secret>,
+    },
     Fs { request_id: u64, op: FsOp },
     Shutdown,
 }
@@ -173,6 +177,15 @@ impl Session {
     /// Hand a secret to the underlying provider (reserved for real providers).
     pub fn set_secret(&self, secret: Secret) -> CoreResult<()> {
         self.send_cmd(Command::SetSecret(secret))
+    }
+
+    /// Hand a private-key candidate (path + optional passphrase) to the provider.
+    pub fn set_private_key(
+        &self,
+        key_path: Option<String>,
+        passphrase: Option<Secret>,
+    ) -> CoreResult<()> {
+        self.send_cmd(Command::SetPrivateKey { key_path, passphrase })
     }
 
     /// Cancel the in-flight operation (if any). Out-of-band: works even while the
@@ -336,6 +349,9 @@ async fn drive(
                     }
                     Some(Command::SetSecret(secret)) => {
                         provider.set_secret(secret);
+                    }
+                    Some(Command::SetPrivateKey { key_path, passphrase }) => {
+                        provider.set_private_key(key_path, passphrase);
                     }
                     Some(Command::Connect) => {
                         if matches!(state, RsSessionState::Connecting | RsSessionState::Connected) {

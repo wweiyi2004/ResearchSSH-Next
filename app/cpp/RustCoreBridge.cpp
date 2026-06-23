@@ -94,6 +94,15 @@ RsErrorCode RustCoreBridge::setSessionPassword(RsSession *session, const QByteAr
                                        static_cast<uintptr_t>(secret.size()));
 }
 
+RsErrorCode RustCoreBridge::setSessionPrivateKey(RsSession *session, const QString &keyPath,
+                                                 const QByteArray &passphrase) {
+    const QByteArray pathUtf8 = keyPath.toUtf8();
+    return rscore_session_set_private_key(
+        session, pathUtf8.constData(),
+        reinterpret_cast<const uint8_t *>(passphrase.constData()),
+        static_cast<uintptr_t>(passphrase.size()));
+}
+
 RsErrorCode RustCoreBridge::confirmHostKey(RsSession *session, bool accept) {
     return rscore_session_confirm_host_key(session, accept);
 }

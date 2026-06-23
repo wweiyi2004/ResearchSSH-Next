@@ -65,7 +65,7 @@ void ServerListModel::seedDemoServers() {
 }
 
 int ServerListModel::addServer(const QString &name, const QString &host, int port,
-                               const QString &username, int provider) {
+                               const QString &username, int provider, const QString &keyPath) {
     const int row = static_cast<int>(m_items.size());
     beginInsertRows(QModelIndex(), row, row);
     m_items.push_back(ServerItem{
@@ -76,6 +76,7 @@ int ServerListModel::addServer(const QString &name, const QString &host, int por
         provider == static_cast<int>(RsProviderKind_Russh) ? RsProviderKind_Russh
                                                            : RsProviderKind_Mock,
         RsSessionState_Idle,
+        keyPath,
     });
     endInsertRows();
     return row;
