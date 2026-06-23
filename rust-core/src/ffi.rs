@@ -510,6 +510,40 @@ pub extern "C" fn rscore_session_set_password(
     })
 }
 
+/// Supplies a private key for public-key authentication. `key_path` null or
+/// empty means "auto-discover the user's ~/.ssh default keys". `passphrase`
+/// null / `passphrase_len == 0` means the key has no passphrase; otherwise the
+/// bytes are copied into a zeroizing buffer immediately. Symmetric with
+/// [`rscore_session_set_password`].
+#[no_mangle]
+pub extern "C" fn rscore_session_set_private_key(
+    session: *mut RsSession,
+    key_path: *const c_char,
+    passphrase: *const u8,
+    passphrase_len: usize,
+) -> RsErrorCode {
+    guard_code(|| {
+        let key_path = if key_path.is_null() {
+            None
+        } else {
+            match cstr_to_string(key_path) {
+                Ok(s) if s.is_empty() => None,
+                Ok(s) => Some(s),
+                Err(code) => return code,
+            }
+        };
+        let passphrase = if passphrase_len == 0 {
+            None
+        } else {
+            match bytes_to_vec(passphrase, passphrase_len) {
+                Ok(b) => Some(Secret::from_bytes(&b)),
+                Err(code) => return code,
+            }
+        };
+        with_session(session, |s| s.set_private_key(key_path, passphrase))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // File management (SFTP) C ABI.
 //
@@ -1028,6 +1062,44 @@ mod tests {
         );
         rscore_session_destroy(ptr::null_mut()); // must not crash
         rscore_destroy(ptr::null_mut()); // must not crash
+    }
+
+    #[test]
+    fn set_private_key_accepts_path_passphrase_and_null() {
+        let mut err = RsErrorCode::Internal;
+        let core = rscore_create(&mut err);
+        let host = CString::new("hpc.example.edu").unwrap();
+        let user = CString::new("researcher").unwrap();
+        let config = RsSessionConfig {
+            host: host.as_ptr(),
+            port: 22,
+            username: user.as_ptr(),
+            provider: RsProviderKind::Mock,
+        };
+        let session =
+            rscore_session_create(core, &config, Some(noop_events), ptr::null_mut(), &mut err);
+        assert!(!session.is_null());
+
+        let path = CString::new("/home/researcher/.ssh/id_ed25519").unwrap();
+        let pass = b"s3cret";
+        // explicit path + passphrase
+        assert_eq!(
+            rscore_session_set_private_key(session, path.as_ptr(), pass.as_ptr(), pass.len()),
+            RsErrorCode::Ok
+        );
+        // null path (auto-discover) + no passphrase
+        assert_eq!(
+            rscore_session_set_private_key(session, ptr::null(), ptr::null(), 0),
+            RsErrorCode::Ok
+        );
+        // null handle is rejected, not crashed
+        assert_eq!(
+            rscore_session_set_private_key(ptr::null_mut(), path.as_ptr(), ptr::null(), 0),
+            RsErrorCode::NullArgument
+        );
+
+        rscore_session_destroy(session);
+        rscore_destroy(core);
     }
 
     // Full file-management pipeline over the C ABI, against the in-memory mock file

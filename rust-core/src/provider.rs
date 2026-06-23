@@ -78,6 +78,11 @@ pub trait SshProvider: Send {
     /// implementation drops it (and thus zeroizes it).
     fn set_secret(&mut self, _secret: Secret) {}
 
+    /// Supply a private-key candidate for public-key auth. `key_path = None`
+    /// means "auto-discover ~/.ssh defaults". Default impl ignores it (the mock
+    /// does not authenticate).
+    fn set_private_key(&mut self, _key_path: Option<String>, _passphrase: Option<Secret>) {}
+
     /// Provide the host-key confirmation gate. Default: ignore (providers that do
     /// not verify host keys, e.g. the mock). Real providers use it to ask the UI.
     fn set_host_key_gate(&mut self, _gate: HostKeyGate) {}
