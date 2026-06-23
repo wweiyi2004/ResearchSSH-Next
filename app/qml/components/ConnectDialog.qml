@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import ResearchSSH
 
@@ -27,6 +28,8 @@ Dialog {
         portField.text = "22"
         userField.text = ""
         passField.text = ""
+        keyPathField.text = ""
+        keyPassField.text = ""
         hostField.forceActiveFocus()
     }
 
@@ -94,6 +97,35 @@ Dialog {
                 background: Rectangle { radius: 6; color: Theme.panelAlt; border.color: passField.activeFocus ? Theme.accent : Theme.border }
                 onAccepted: connectButton.clicked()
             }
+
+            Text { text: "私钥文件"; color: Theme.muted; font.pixelSize: 13 }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                TextField {
+                    id: keyPathField
+                    Layout.fillWidth: true
+                    placeholderText: "留空则自动发现 ~/.ssh"
+                    color: Theme.text
+                    placeholderTextColor: Theme.faint
+                    background: Rectangle { radius: 6; color: Theme.panelAlt; border.color: keyPathField.activeFocus ? Theme.accent : Theme.border }
+                }
+                StyledButton {
+                    text: "浏览…"
+                    onClicked: keyFileDialog.open()
+                }
+            }
+
+            Text { text: "密钥口令"; color: Theme.muted; font.pixelSize: 13 }
+            TextField {
+                id: keyPassField
+                Layout.fillWidth: true
+                echoMode: TextInput.Password
+                placeholderText: "加密私钥才需要"
+                color: Theme.text
+                placeholderTextColor: Theme.faint
+                background: Rectangle { radius: 6; color: Theme.panelAlt; border.color: keyPassField.activeFocus ? Theme.accent : Theme.border }
+            }
         }
 
         Text {
@@ -124,11 +156,20 @@ Dialog {
                     dialog.controller.connectToHost(hostField.text,
                                                     parseInt(portField.text) || 22,
                                                     userField.text,
-                                                    passField.text, "")
+                                                    passField.text, "",
+                                                    keyPathField.text,
+                                                    keyPassField.text)
                     passField.text = ""
+                    keyPassField.text = ""
                     dialog.close()
                 }
             }
         }
+    }
+
+    FileDialog {
+        id: keyFileDialog
+        title: "选择私钥文件"
+        onAccepted: keyPathField.text = selectedFile.toString().replace("file:///", "")
     }
 }
