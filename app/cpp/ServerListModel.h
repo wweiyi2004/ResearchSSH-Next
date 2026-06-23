@@ -20,6 +20,9 @@ struct ServerItem {
     QString username;
     RsProviderKind provider = RsProviderKind_Mock;
     int status = RsSessionState_Idle; // mirrors RsSessionState
+    // Optional private-key path for public-key auth ("" = auto-discover ~/.ssh).
+    // Kept last so existing aggregate initialisations stay valid.
+    QString keyPath;
 };
 
 class ServerListModel : public QAbstractListModel {
@@ -56,7 +59,8 @@ public:
     // Append a user-defined server (e.g. from the connection dialog). Returns the
     // new row index.
     Q_INVOKABLE int addServer(const QString &name, const QString &host, int port,
-                              const QString &username, int provider);
+                              const QString &username, int provider,
+                              const QString &keyPath = QString());
 
     static QString statusText(int status);
 

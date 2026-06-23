@@ -89,7 +89,8 @@ public slots:
     // password is stored in the CredentialStore and handed to the core; it never
     // lives in QML state beyond the input field.
     void connectToHost(const QString &host, int port, const QString &username,
-                       const QString &password, const QString &name);
+                       const QString &password, const QString &name,
+                       const QString &keyPath, const QString &keyPassphrase);
     void disconnectCurrent();
     void cancel();
     // Deliver the user's host-key confirmation decision.
