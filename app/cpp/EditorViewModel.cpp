@@ -13,26 +13,25 @@ QString EditorViewModel::fileName() const {
 
 void EditorViewModel::beginOpen(const QString &path) {
     m_path = path;
+    m_isOpen = true;
     m_busy = true;
-    m_saving = false;
     emit changed();
 }
 
 void EditorViewModel::setContent(const QString &path, const QByteArray &data) {
-    m_path = path;
-    m_busy = false;
+    if (m_path == path)
+        m_busy = false;
     m_isOpen = true;
-    m_saving = false;
     emit changed();
     emit contentLoaded(path, QString::fromUtf8(data));
 }
 
-void EditorViewModel::failOpen() {
-    m_path.clear();
-    m_isOpen = false;
-    m_busy = false;
-    m_saving = false;
-    emit changed();
+void EditorViewModel::failOpen(const QString &path, const QString &message) {
+    if (path.isEmpty() || m_path == path) {
+        m_busy = false;
+        emit changed();
+    }
+    emit openFailed(path, message);
 }
 
 void EditorViewModel::activatePath(const QString &path) {
@@ -41,7 +40,6 @@ void EditorViewModel::activatePath(const QString &path) {
     m_path = path;
     m_isOpen = true;
     m_busy = false;
-    m_saving = false;
     emit changed();
 }
 
@@ -52,15 +50,14 @@ void EditorViewModel::beginSave() {
     emit changed();
 }
 
-void EditorViewModel::finishSave(bool ok, const QString &message) {
-    if (!m_saving && ok)
-        return;
+void EditorViewModel::finishSave(bool ok, const QString &message, const QString &path) {
     m_saving = false;
     emit changed();
+    const QString target = path.isEmpty() ? m_path : path;
     if (ok)
-        emit saveSucceeded();
+        emit saveSucceeded(target);
     else
-        emit saveFailed(message);
+        emit saveFailed(target, message);
 }
 
 void EditorViewModel::close() {

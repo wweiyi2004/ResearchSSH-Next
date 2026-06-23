@@ -369,7 +369,7 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
                     }
                 }
             } else if (pending.kind == PendingFs::EditorOpen) {
-                m_editor->failOpen();
+                m_editor->failOpen(pending.path, result.message);
             }
 
             const QString msg =
@@ -377,7 +377,7 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
                     ? RustCoreBridge::describe(static_cast<RsErrorCode>(result.errorCode))
                     : result.message;
             if (pending.kind == PendingFs::EditorSave)
-                m_editor->finishSave(false, msg);
+                m_editor->finishSave(false, msg, pending.path);
             m_terminal->appendNotice(QStringLiteral("文件操作失败：%1").arg(msg));
             continue;
         }
@@ -402,14 +402,14 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
         case PendingFs::EditorOpen:
             if (result.kind == RsFsResultKind_Content) {
                 if (static_cast<quint64>(result.data.size()) >= kEditorReadLimit) {
-                    m_editor->failOpen();
+                    m_editor->failOpen(pending.path, QStringLiteral("文件达到编辑器读取上限。"));
                     m_terminal->appendNotice(QStringLiteral(
                         "拒绝打开：文件达到编辑器读取上限 %1 MB。")
                                                 .arg(kEditorReadLimit / 1024 / 1024));
                     break;
                 }
                 if (!looksLikeTextBuffer(result.data)) {
-                    m_editor->failOpen();
+                    m_editor->failOpen(pending.path, QStringLiteral("该文件看起来不是 UTF-8 文本。"));
                     m_terminal->appendNotice(
                         QStringLiteral("拒绝打开：该文件看起来不是 UTF-8 文本。"));
                     break;
@@ -417,13 +417,13 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
                 m_editor->setContent(pending.path, result.data);
                 m_terminal->appendNotice(QStringLiteral("已打开远端文件：%1").arg(pending.path));
             } else {
-                m_editor->failOpen();
+                m_editor->failOpen(pending.path, QStringLiteral("返回结果类型不匹配。"));
                 m_terminal->appendNotice(QStringLiteral("打开文件失败：返回结果类型不匹配。"));
             }
             break;
         case PendingFs::EditorSave:
             if (result.kind == RsFsResultKind_Ok) {
-                m_editor->finishSave(true);
+                m_editor->finishSave(true, {}, pending.path);
                 m_terminal->appendNotice(QStringLiteral("已保存远端文件：%1").arg(pending.path));
                 if (!pending.refreshDir.isNull())
                     expandDir(pending.refreshDir);
@@ -432,7 +432,8 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
             } else {
                 // Any non-Ok, non-Error result is unexpected for a write; fail the
                 // save so the editor doesn't stay stuck in the "saving" state.
-                m_editor->finishSave(false, QStringLiteral("保存失败：返回结果类型不匹配。"));
+                m_editor->finishSave(false, QStringLiteral("保存失败：返回结果类型不匹配。"),
+                                     pending.path);
                 m_terminal->appendNotice(QStringLiteral("保存失败：返回结果类型不匹配。"));
             }
             break;
@@ -467,7 +468,7 @@ void AppController::openPath(const QString &path) {
     m_editor->beginOpen(path);
     const quint64 id = m_bridge.fsRead(m_session, path, kEditorReadLimit);
     if (id == 0) {
-        m_editor->failOpen();
+        m_editor->failOpen(path, QStringLiteral("无法提交读取请求。"));
         m_terminal->appendNotice(QStringLiteral("无法提交读取请求。"));
         return;
     }
@@ -639,7 +640,7 @@ void AppController::saveEditor(const QString &text) {
     m_editor->beginSave();
     const quint64 id = m_bridge.fsWrite(m_session, path, text.toUtf8());
     if (id == 0) {
-        m_editor->finishSave(false, QStringLiteral("无法提交保存请求。"));
+        m_editor->finishSave(false, QStringLiteral("无法提交保存请求。"), path);
         m_terminal->appendNotice(QStringLiteral("无法提交保存请求。"));
         return;
     }
