@@ -744,6 +744,10 @@ Rectangle {
                     color: Theme.faint
                     font.pixelSize: 14
                     font.family: "Cascadia Mono"
+                    lineHeightMode: Text.FixedHeight
+                    lineHeight: editorText.lineCount > 0
+                                ? editorText.contentHeight / editorText.lineCount
+                                : font.pixelSize
                     horizontalAlignment: Text.AlignRight
                 }
             }
@@ -929,6 +933,11 @@ Rectangle {
         }
         function onContentLoaded(path, text) {
             root.upsertLoadedDocument(path, text)
+        }
+        function onPathClosed(path) {
+            var index = root.findDocumentIndex(path)
+            if (index >= 0)
+                root.closeDocument(index)
         }
         function onOpenFailed(path, message) {
             root.handleOpenFailed(path, message)

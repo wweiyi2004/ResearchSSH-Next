@@ -43,6 +43,12 @@ void EditorViewModel::activatePath(const QString &path) {
     emit changed();
 }
 
+void EditorViewModel::closePath(const QString &path) {
+    if (path.isEmpty())
+        return;
+    emit pathClosed(path);
+}
+
 void EditorViewModel::beginSave() {
     if (!m_isOpen)
         return;

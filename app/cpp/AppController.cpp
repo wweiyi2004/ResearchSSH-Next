@@ -322,6 +322,7 @@ void AppController::refreshResourceSnapshot() {
 
     m_resourceSnapshotBusy = true;
     m_resourceCapture.clear();
+    m_resourceMarkerTail.clear();
     m_resourceSnapshotText = QStringLiteral("正在采集远端资源快照...");
     emit resourceSnapshotChanged();
 
@@ -479,7 +480,7 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
             if (result.kind == RsFsResultKind_Ok) {
                 m_terminal->appendNotice(QStringLiteral("文件操作完成。"));
                 if (pending.path == m_editor->path())
-                    m_editor->close();
+                    m_editor->closePath(pending.path);
                 if (pending.clearClipboard) {
                     m_clipboardPath.clear();
                     m_clipboardCut = false;
@@ -919,13 +920,20 @@ void AppController::parseResourceSnapshot(const QString &text) {
             bool okUtil = false;
             bool okUsed = false;
             bool okTotal = false;
-            const bool hasUuid = parts.size() >= 6;
+            const bool hasUuid =
+                parts.size() >= 6 && parts.at(1).trimmed().startsWith(QStringLiteral("GPU-"));
+            const int size = parts.size();
             const QString index = parts.at(0).trimmed();
             const QString uuid = hasUuid ? parts.at(1).trimmed() : QString();
-            const QString name = parts.at(hasUuid ? 2 : 1).trimmed();
-            const int util = parts.at(hasUuid ? 3 : 2).trimmed().toInt(&okUtil);
-            const int used = parts.at(hasUuid ? 4 : 3).trimmed().toInt(&okUsed);
-            const int total = parts.at(hasUuid ? 5 : 4).trimmed().toInt(&okTotal);
+            const int nameStart = hasUuid ? 2 : 1;
+            const int nameEndExclusive = size - 3;
+            QStringList nameParts;
+            for (int i = nameStart; i < nameEndExclusive; ++i)
+                nameParts.push_back(parts.at(i).trimmed());
+            const QString name = nameParts.join(QStringLiteral(", "));
+            const int util = parts.at(size - 3).trimmed().toInt(&okUtil);
+            const int used = parts.at(size - 2).trimmed().toInt(&okUsed);
+            const int total = parts.at(size - 1).trimmed().toInt(&okTotal);
             if (!okUtil || !okUsed || !okTotal)
                 continue;
             const QString label = QStringLiteral("GPU %1").arg(index);
@@ -945,12 +953,17 @@ void AppController::parseResourceSnapshot(const QString &text) {
                 continue;
             bool okMem = false;
             const bool hasDevice = parts.size() >= 4;
+            const int size = parts.size();
             QString device = hasDevice ? parts.at(0).trimmed() : QStringLiteral("GPU");
             device = gpuUuidToLabel.value(device, device);
             const QString pid = hasDevice ? parts.at(1).trimmed() : parts.at(0).trimmed();
-            const QString name = hasDevice ? parts.at(2).trimmed() : parts.at(1).trimmed();
-            const int gpuMem =
-                (hasDevice ? parts.at(3).trimmed() : parts.at(2).trimmed()).toInt(&okMem);
+            const int nameStart = hasDevice ? 2 : 1;
+            const int nameEndExclusive = size - 1;
+            QStringList nameParts;
+            for (int i = nameStart; i < nameEndExclusive; ++i)
+                nameParts.push_back(parts.at(i).trimmed());
+            const QString name = nameParts.join(QStringLiteral(", "));
+            const int gpuMem = parts.at(size - 1).trimmed().toInt(&okMem);
             QVariantMap proc;
             proc.insert(QStringLiteral("pid"), pid);
             proc.insert(QStringLiteral("user"), QStringLiteral("-"));
@@ -1040,21 +1053,36 @@ void AppController::parseResourceSnapshot(const QString &text) {
 
 void AppController::captureResourceOutput(const QByteArray &data) {
     const QString chunk = QString::fromUtf8(data);
-    if (!m_resourceSnapshotBusy && !containsMarkerLine(chunk, kResourceBegin)) {
+    QString captureChunk = chunk;
+    if (!m_resourceSnapshotBusy) {
+        const QString probe = m_resourceMarkerTail + chunk;
+        if (!containsMarkerLine(probe, kResourceBegin)) {
+            m_resourceMarkerTail = probe.right(QString::fromLatin1(kResourceBegin).size() + 2);
+            return;
+        }
+        captureChunk = probe;
+        m_resourceMarkerTail.clear();
+        m_resourceSnapshotBusy = true;
+    }
+
+    m_resourceCapture.append(captureChunk);
+    if (!containsMarkerLine(m_resourceCapture, kResourceBegin)) {
+        m_resourceCapture = m_resourceCapture.right(QString::fromLatin1(kResourceBegin).size() + 2);
         return;
     }
 
-    m_resourceCapture.append(chunk);
     if (m_resourceCapture.size() > 50000) {
         m_resourceSnapshotBusy = false;
         m_resourceSnapshotText = QStringLiteral("资源快照过长，已停止解析");
         m_resourceCapture.clear();
+        m_resourceMarkerTail.clear();
         emit resourceSnapshotChanged();
         return;
     }
     if (extractMarkedBody(m_resourceCapture, nullptr)) {
         const QString captured = m_resourceCapture;
         m_resourceCapture.clear();
+        m_resourceMarkerTail.clear();
         parseResourceSnapshot(captured);
     }
 }

@@ -182,6 +182,7 @@ private:
     QString m_resourceSnapshotText = QStringLiteral("尚未采集资源快照");
     bool m_resourceSnapshotBusy = false;
     QString m_resourceCapture;
+    QString m_resourceMarkerTail;
 
     RustCoreBridge m_bridge;
     ServerListModel *m_servers = nullptr;
