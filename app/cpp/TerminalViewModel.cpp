@@ -5,7 +5,9 @@ namespace researchssh {
 TerminalViewModel::TerminalViewModel(QObject *parent) : QObject(parent) {}
 
 void TerminalViewModel::appendBytes(const QByteArray &bytes) {
-    QString chunk = QString::fromUtf8(bytes);
+    // Stateful decode: a multi-byte sequence straddling two chunks is held over and
+    // completed on the next call rather than emitting a replacement character.
+    QString chunk = m_utf8.decode(bytes);
     // Framework stage: no terminal emulator yet. Normalise CRLF and drop other
     // C0 control characters (except tab/newline) so the placeholder view is clean.
     chunk.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));

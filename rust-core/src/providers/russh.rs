@@ -148,9 +148,16 @@ impl SshProvider for RusshProvider {
         .await
         .map_err(|e| connect_err("connect", e))?;
 
-        // Password authentication (the only method wired in this step).
+        // Password authentication (the only method wired in this step). Require
+        // valid UTF-8 rather than silently lossy-replacing bytes: a mangled password
+        // would just fail auth with a confusing error, and `russh` needs a `String`.
         let password = match &self.secret {
-            Some(secret) => String::from_utf8_lossy(secret.expose()).into_owned(),
+            Some(secret) => String::from_utf8(secret.expose().to_vec()).map_err(|_| {
+                CoreError::with_detail(
+                    RsErrorCode::ConnectFailed,
+                    "password is not valid UTF-8",
+                )
+            })?,
             None => {
                 return Err(CoreError::with_detail(
                     RsErrorCode::ConnectFailed,
@@ -337,6 +344,21 @@ fn join_path(dir: &str, name: &str) -> String {
     format!("{}/{}", dir.trim_end_matches('/'), name)
 }
 
+/// Classify an SFTP entry, distinguishing symlinks from real directories/files.
+/// Whether `meta` came from STAT or LSTAT determines whether a symlink shows up as
+/// `Symlink` (LSTAT, the link itself) or as its target's kind (STAT, followed).
+fn map_meta_kind(meta: &russh_sftp::protocol::FileAttributes) -> FileKind {
+    if meta.is_symlink() {
+        FileKind::Symlink
+    } else if meta.is_dir() {
+        FileKind::Directory
+    } else if meta.is_regular() {
+        FileKind::File
+    } else {
+        FileKind::Other
+    }
+}
+
 #[async_trait]
 impl FileProvider for SftpFileProvider {
     async fn list_dir(&mut self, path: &str) -> CoreResult<Vec<FileEntry>> {
@@ -352,19 +374,17 @@ impl FileProvider for SftpFileProvider {
             if name == "." || name == ".." {
                 continue;
             }
+            // `read_dir` carries each entry's own attributes (LSTAT semantics), so a
+            // symlink is reported as `Symlink`, not as whatever it points at.
             let meta = entry.metadata();
-            let is_dir = meta.is_dir();
+            let kind = map_meta_kind(&meta);
             out.push(FileEntry {
                 path: join_path(&dir, &name),
-                kind: if is_dir {
-                    FileKind::Directory
-                } else {
-                    FileKind::File
-                },
+                kind,
                 size: meta.size.unwrap_or(0),
                 modified_unix: meta.mtime.map(|m| m as i64).unwrap_or(-1),
                 mode: meta.permissions.unwrap_or(0),
-                editable_text: !is_dir && looks_like_text(&name),
+                editable_text: kind == FileKind::File && looks_like_text(&name),
                 name,
             });
         }
@@ -379,17 +399,14 @@ impl FileProvider for SftpFileProvider {
             .await
             .map_err(|e| sftp_err("metadata", e))?;
         let name = p.rsplit('/').next().unwrap_or(&p).to_string();
-        let is_dir = meta.is_dir();
+        // `metadata` follows symlinks, so an explicit stat reports the target's kind.
+        let kind = map_meta_kind(&meta);
         Ok(FileEntry {
-            kind: if is_dir {
-                FileKind::Directory
-            } else {
-                FileKind::File
-            },
+            kind,
             size: meta.size.unwrap_or(0),
             modified_unix: meta.mtime.map(|m| m as i64).unwrap_or(-1),
             mode: meta.permissions.unwrap_or(0),
-            editable_text: !is_dir && looks_like_text(&name),
+            editable_text: kind == FileKind::File && looks_like_text(&name),
             name,
             path: p,
         })
@@ -397,9 +414,22 @@ impl FileProvider for SftpFileProvider {
 
     async fn read_file(&mut self, path: &str, max_len: u64) -> CoreResult<Vec<u8>> {
         let p = self.resolve_path(path).await;
-        let mut data = self.sftp.read(p).await.map_err(|e| sftp_err("read", e))?;
-        if max_len > 0 && data.len() as u64 > max_len {
-            data.truncate(max_len as usize);
+        let file = self.sftp.open(p).await.map_err(|e| sftp_err("open", e))?;
+        let mut data = Vec::new();
+        if max_len > 0 {
+            // Bounded read: pull at most `max_len` bytes so opening a huge remote
+            // file (e.g. a multi-GB log) can't OOM the core. Previously the whole
+            // file was read into memory and only then truncated.
+            file.take(max_len)
+                .read_to_end(&mut data)
+                .await
+                .map_err(|e| sftp_err("read", e))?;
+        } else {
+            // `max_len == 0` means "no cap" (callers that genuinely want everything).
+            let mut file = file;
+            file.read_to_end(&mut data)
+                .await
+                .map_err(|e| sftp_err("read", e))?;
         }
         Ok(data)
     }
@@ -423,12 +453,16 @@ impl FileProvider for SftpFileProvider {
 
     async fn remove(&mut self, path: &str, recursive: bool) -> CoreResult<()> {
         let path = self.resolve_path(path).await;
+        // LSTAT, NOT stat: a delete must act on the path itself and never follow a
+        // symlink. Following it here previously let a recursive delete of a symlink
+        // that pointed at a directory wipe out the *target* directory's contents.
         let meta = self
             .sftp
-            .metadata(path.clone())
+            .symlink_metadata(path.clone())
             .await
             .map_err(|e| sftp_err("stat", e))?;
-        if meta.is_dir() {
+        // Only a real directory (a symlink to a directory is not one) is descended.
+        if meta.is_dir() && !meta.is_symlink() {
             if recursive {
                 let read_dir = self
                     .sftp
@@ -448,6 +482,8 @@ impl FileProvider for SftpFileProvider {
                 .await
                 .map_err(|e| sftp_err("rmdir", e))
         } else {
+            // Regular file, symlink, or other: a single unlink. `remove_file` removes
+            // a symlink itself without dereferencing it.
             self.sftp
                 .remove_file(path)
                 .await
@@ -475,6 +511,45 @@ impl FileProvider for SftpFileProvider {
             .write(to, &data)
             .await
             .map_err(|e| sftp_err("copy write", e))
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+    use russh_sftp::protocol::FileAttributes;
+
+    fn attrs() -> FileAttributes {
+        FileAttributes {
+            size: None,
+            uid: None,
+            user: None,
+            gid: None,
+            group: None,
+            permissions: None,
+            atime: None,
+            mtime: None,
+        }
+    }
+
+    // A symlink must classify as `Symlink`, never `Directory` — that is what keeps a
+    // recursive delete from descending through a link into its target. The ordering
+    // matters because SFTP's S_IFLNK shares bits with S_IFREG, so `is_regular()` is
+    // also true for a symlink; `map_meta_kind` checks `is_symlink()` first.
+    #[test]
+    fn symlink_is_classified_before_dir_or_regular() {
+        let mut link = attrs();
+        link.set_symlink(true);
+        assert!(link.is_symlink());
+        assert_eq!(map_meta_kind(&link), FileKind::Symlink);
+
+        let mut dir = attrs();
+        dir.set_dir(true);
+        assert_eq!(map_meta_kind(&dir), FileKind::Directory);
+
+        let mut reg = attrs();
+        reg.set_regular(true);
+        assert_eq!(map_meta_kind(&reg), FileKind::File);
     }
 }
 

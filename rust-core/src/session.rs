@@ -28,6 +28,13 @@ pub trait EventEmitter: Send + Sync {
     /// Deliver a batch of events. Implementations must treat this as one atomic
     /// hand-off (the FFI emitter performs exactly one callback per call).
     fn emit_batch(&self, events: Vec<SessionEvent>);
+
+    /// Permanently stop forwarding events to the underlying sink. After this
+    /// returns, no in-flight or future `emit_batch` will reach the C callback.
+    /// Called at teardown so that a driver task which outlived its join timeout
+    /// (and was therefore detached) can never touch freed `user_data`. Default:
+    /// no-op (test emitters don't need it).
+    fn deactivate(&self) {}
 }
 
 /// Shared slot holding the sender for a pending host-key decision.
@@ -62,6 +69,10 @@ impl HostKeyGate {
 pub trait FileEmitter: Send + Sync {
     /// Deliver a batch of file results (one callback per call).
     fn emit_file_results(&self, results: Vec<FileResult>);
+
+    /// See [`EventEmitter::deactivate`]: makes the emitter permanently inert so a
+    /// detached driver task cannot invoke the C callback after teardown.
+    fn deactivate(&self) {}
 }
 
 /// A file operation requested over the C ABI; carried with its request id.
@@ -100,6 +111,9 @@ pub struct Session {
     host_key_pending: HostKeyPending,
     next_request_id: AtomicU64,
     file_emitter: FileEmitterSlot,
+    /// Kept so teardown can deactivate the event sink even if the driver task is
+    /// still running (see [`Session::shutdown_and_join`]).
+    emitter: Arc<dyn EventEmitter>,
 }
 
 impl Session {
@@ -115,6 +129,9 @@ impl Session {
         };
         let file_emitter: FileEmitterSlot = Arc::new(Mutex::new(None));
         let file_emitter_driver = file_emitter.clone();
+        // Retained on the handle so teardown can deactivate it; the driver task gets
+        // its own clone moved in below.
+        let emitter_for_session = emitter.clone();
         let join = handle.spawn(async move {
             drive(
                 config,
@@ -134,6 +151,7 @@ impl Session {
             host_key_pending,
             next_request_id: AtomicU64::new(0),
             file_emitter,
+            emitter: emitter_for_session,
         }
     }
 
@@ -234,8 +252,16 @@ impl Session {
     }
 
     /// Ask the driver to shut down and block until it does (bounded). After this
-    /// returns, the driver task is gone, so no further events/callbacks can fire —
-    /// this is what makes `rscore_session_destroy` safe.
+    /// returns, no further events/callbacks can fire — this is what makes
+    /// `rscore_session_destroy` safe.
+    ///
+    /// Two layers guarantee that:
+    /// 1. We signal `Shutdown` + `cancel` (which interrupts any in-flight
+    ///    connect/send/fs op) and join the driver within a bounded timeout.
+    /// 2. Whether or not the join completed in time, we then `deactivate` every
+    ///    emitter. If the driver overran the timeout and was detached, its later
+    ///    `emit_*` calls become no-ops instead of touching `user_data` the C++
+    ///    owner is about to free.
     pub fn shutdown_and_join(&self) {
         let _ = self.cmd_tx.send(Command::Shutdown);
         self.cancel.notify_waiters();
@@ -243,7 +269,12 @@ impl Session {
         if let Some(join) = join {
             let _ = self
                 .handle
-                .block_on(async move { tokio::time::timeout(Duration::from_secs(2), join).await });
+                .block_on(async move { tokio::time::timeout(Duration::from_secs(3), join).await });
+        }
+        // Make the sinks inert regardless of whether the join succeeded.
+        self.emitter.deactivate();
+        if let Some(em) = self.file_emitter.lock().expect("file emitter lock").take() {
+            em.deactivate();
         }
     }
 }
@@ -293,7 +324,13 @@ async fn drive(
                 match maybe_cmd {
                     None | Some(Command::Shutdown) => {
                         if matches!(state, RsSessionState::Connected | RsSessionState::Connecting) {
-                            let _ = provider.disconnect().await;
+                            // Bound the disconnect so a wedged network teardown can't
+                            // keep the driver (and the joining destroy call) parked.
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                provider.disconnect(),
+                            )
+                            .await;
                         }
                         break;
                     }
@@ -348,7 +385,24 @@ async fn drive(
                         set_state(&*emitter, &mut state, RsSessionState::Disconnected);
                     }
                     Some(Command::Fs { request_id, op }) => {
-                        let result = run_fs_op(&mut file_provider, request_id, op).await;
+                        // Race the op against cancel so a long transfer can be
+                        // interrupted by the cancel button or by teardown (which is
+                        // what lets the driver exit promptly on shutdown).
+                        let result = match run_until_cancel(
+                            run_fs_op(&mut file_provider, request_id, op),
+                            &cancel,
+                        )
+                        .await
+                        {
+                            Some(r) => r,
+                            None => FileResult {
+                                request_id,
+                                payload: FilePayload::Error {
+                                    code: RsErrorCode::Cancelled,
+                                    message: "file operation cancelled".into(),
+                                },
+                            },
+                        };
                         if let Some(em) = file_emitter.lock().expect("file emitter lock").clone() {
                             em.emit_file_results(vec![result]);
                         }
@@ -449,6 +503,20 @@ where
     tokio::select! {
         r = &mut op => OpOutcome::Done(r),
         _ = cancel.notified() => OpOutcome::Cancelled,
+    }
+}
+
+/// Like [`run_cancellable`] but generic over the output: yields `Some(value)` if
+/// the future finished, or `None` if cancel fired first (dropping the future and
+/// thus aborting the in-flight operation).
+async fn run_until_cancel<F, T>(op: F, cancel: &Notify) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(op);
+    tokio::select! {
+        r = &mut op => Some(r),
+        _ = cancel.notified() => None,
     }
 }
 
