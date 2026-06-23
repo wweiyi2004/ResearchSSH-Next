@@ -9,6 +9,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringDecoder>
 
 namespace researchssh {
 
@@ -38,6 +39,10 @@ private:
     void appendText(const QString &chunk);
 
     QString m_text;
+    // Retains an incomplete multi-byte UTF-8 sequence across chunk boundaries, so a
+    // character split between two reads from the core is decoded correctly instead
+    // of turning into replacement characters.
+    QStringDecoder m_utf8{QStringDecoder::Utf8};
     // Cap the buffer so a long-running session can't grow it without bound.
     static constexpr int kMaxChars = 200000;
 };

@@ -3,7 +3,15 @@
 namespace researchssh {
 
 bool MockCredentialStore::store(const QString &key, const QByteArray &secret) {
-    m_secrets.insert(key, secret);
+    // Wipe any previous secret for this key before dropping it, so an overwritten
+    // password isn't left lingering on the heap.
+    auto it = m_secrets.find(key);
+    if (it != m_secrets.end())
+        it.value().fill('\0');
+    // Deep-copy into a buffer we exclusively own (detached from the caller's copy),
+    // so the later fill('\0') in remove()/the destructor wipes these very bytes in
+    // place rather than detaching from a shared copy and leaving the original.
+    m_secrets.insert(key, QByteArray(secret.constData(), secret.size()));
     return true;
 }
 

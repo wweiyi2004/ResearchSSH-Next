@@ -316,6 +316,11 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
                     expandDir(pending.refreshDir);
                 if (!pending.extraRefreshDir.isNull() && pending.extraRefreshDir != pending.refreshDir)
                     expandDir(pending.extraRefreshDir);
+            } else {
+                // Any non-Ok, non-Error result is unexpected for a write; fail the
+                // save so the editor doesn't stay stuck in the "saving" state.
+                m_editor->finishSave(false, QStringLiteral("保存失败：返回结果类型不匹配。"));
+                m_terminal->appendNotice(QStringLiteral("保存失败：返回结果类型不匹配。"));
             }
             break;
         case PendingFs::Mutate:

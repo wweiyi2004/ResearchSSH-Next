@@ -36,7 +36,7 @@ use crate::{CoreResult, RsErrorCode};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Opaque handles (cbindgen emits forward-declared opaque structs for these).
@@ -95,9 +95,17 @@ unsafe impl Sync for CallbackTarget {}
 
 struct FfiEmitter {
     target: CallbackTarget,
+    /// `true` until teardown calls [`EventEmitter::deactivate`]. Guarded by a mutex
+    /// so deactivation blocks until any in-flight callback returns, and any callback
+    /// that begins after deactivation observes `false` and never touches `user_data`.
+    active: Mutex<bool>,
 }
 
 impl EventEmitter for FfiEmitter {
+    fn deactivate(&self) {
+        *self.active.lock().expect("emitter active lock") = false;
+    }
+
     fn emit_batch(&self, events: Vec<SessionEvent>) {
         if events.is_empty() {
             return;
@@ -179,8 +187,12 @@ impl EventEmitter for FfiEmitter {
         // `cb` is a safe `extern "C" fn` pointer (validated non-null at session
         // creation), so calling it needs no `unsafe`. The event/data/message
         // pointers are valid for the duration of this synchronous call; the backing
-        // buffers are dropped only after the callback returns.
-        (self.target.cb)(self.target.user_data, c_events.as_ptr(), c_events.len());
+        // buffers are dropped only after the callback returns. The gate is held
+        // across the call so teardown cannot free `user_data` mid-callback.
+        let active = self.active.lock().expect("emitter active lock");
+        if *active {
+            (self.target.cb)(self.target.user_data, c_events.as_ptr(), c_events.len());
+        }
     }
 }
 
@@ -391,6 +403,7 @@ pub extern "C" fn rscore_session_create(
         };
         let emitter: Arc<dyn EventEmitter> = Arc::new(FfiEmitter {
             target: CallbackTarget { cb, user_data },
+            active: Mutex::new(true),
         });
         let session = Session::spawn(core.runtime.handle(), conn, emitter);
         set_err(out_err, RsErrorCode::Ok);
@@ -593,6 +606,8 @@ unsafe impl Sync for FileCallbackTarget {}
 
 struct FfiFileEmitter {
     target: FileCallbackTarget,
+    /// See [`FfiEmitter::active`]; same teardown-safety contract for file results.
+    active: Mutex<bool>,
 }
 
 fn map_kind(kind: FileKind) -> RsFileKind {
@@ -605,6 +620,10 @@ fn map_kind(kind: FileKind) -> RsFileKind {
 }
 
 impl FileEmitter for FfiFileEmitter {
+    fn deactivate(&self) {
+        *self.active.lock().expect("file emitter active lock") = false;
+    }
+
     fn emit_file_results(&self, results: Vec<FileResult>) {
         if results.is_empty() {
             return;
@@ -738,7 +757,10 @@ impl FileEmitter for FfiFileEmitter {
             c_results.push(result);
         }
 
-        (self.target.cb)(self.target.user_data, c_results.as_ptr(), c_results.len());
+        let active = self.active.lock().expect("file emitter active lock");
+        if *active {
+            (self.target.cb)(self.target.user_data, c_results.as_ptr(), c_results.len());
+        }
     }
 }
 
@@ -764,6 +786,7 @@ pub extern "C" fn rscore_session_set_file_callback(
             Some(s) => {
                 let emitter: Arc<dyn FileEmitter> = Arc::new(FfiFileEmitter {
                     target: FileCallbackTarget { cb, user_data },
+                    active: Mutex::new(true),
                 });
                 s.session.set_file_emitter(emitter);
                 RsErrorCode::Ok
