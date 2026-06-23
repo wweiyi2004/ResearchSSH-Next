@@ -1,0 +1,65 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "windows-msvc",
+            "displayName": "Windows MSVC x64 (Release)",
+            "description": "Visual Studio 2022 generator, x64, Release. Set CMAKE_PREFIX_PATH to your Qt 6.5+ MSVC kit.",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build/windows-msvc",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_CONFIGURATION_TYPES": "Release;Debug"
+            }
+        },
+        {
+            "name": "windows-msvc-ninja",
+            "displayName": "Windows MSVC x64 (Ninja, Release)",
+            "description": "Ninja generator (requires ninja + a Developer Command Prompt / vcvars environment).",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/windows-msvc-ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "windows-msvc-russh",
+            "displayName": "Windows MSVC x64 (Release, real SSH via russh)",
+            "description": "Like windows-msvc but builds the Rust core with the russh feature so the GUI can open real SSH sessions.",
+            "inherits": "windows-msvc",
+            "binaryDir": "${sourceDir}/build/windows-msvc-russh",
+            "cacheVariables": {
+                "RESEARCHSSH_RUST_FEATURES": "russh"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "windows-msvc",
+            "displayName": "Build (Windows MSVC, Release)",
+            "configurePreset": "windows-msvc",
+            "configuration": "Release"
+        },
+        {
+            "name": "windows-msvc-ninja",
+            "displayName": "Build (Ninja, Release)",
+            "configurePreset": "windows-msvc-ninja"
+        },
+        {
+            "name": "windows-msvc-russh",
+            "displayName": "Build (Windows MSVC, Release, russh)",
+            "configurePreset": "windows-msvc-russh",
+            "configuration": "Release"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "windows-msvc",
+            "configurePreset": "windows-msvc",
+            "configuration": "Release",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}

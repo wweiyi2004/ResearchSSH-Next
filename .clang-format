@@ -1,0 +1,18 @@
+# clang-format configuration for the C++/Qt layer (app/cpp).
+# Run: clang-format -i app/cpp/*.cpp app/cpp/*.h
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++20
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+PointerAlignment: Right
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+BreakBeforeBraces: Attach
+NamespaceIndentation: None
+FixNamespaceComments: true
+SortIncludes: CaseInsensitive
+IncludeBlocks: Preserve
+AlwaysBreakTemplateDeclarations: Yes

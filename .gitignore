@@ -1,0 +1,30 @@
+# Build output
+/build/
+/rust-core/target/
+**/target/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+*.cmake.stamp
+
+# Qt / QML cache
+*.qmlc
+*.jsc
+
+# IDE
+/.vs/
+/.vscode/
+/.idea/
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Tooling logs
+/aqtinstall.log
+
+# NOTE: rust-core/Cargo.lock and rust-core/include/research_ssh_core.h are
+# intentionally committed (reproducible builds + header available before first
+# cargo build).

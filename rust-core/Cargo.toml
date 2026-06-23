@@ -1,0 +1,48 @@
+[package]
+name = "research_ssh_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust security core for ResearchSSH-Next (SSH/SFTP, sessions, async scheduling) exposed over a stable C ABI."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The core is consumed by the C++/Qt layer as a static library (staticlib) and
+# is also built as an rlib so that integration tests under `tests/` can link it.
+[lib]
+name = "research_ssh_core"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# Default keeps the build light and fully self-contained: only the Mock provider
+# is wired in. The `russh` feature pulls the real-SSH backend (src/providers/russh.rs).
+default = []
+russh = ["dep:russh", "dep:russh-sftp"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+async-trait = "0.1"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+# Real SSH backend (optional; enabled by the `russh` feature). Use the pure-Rust
+# `ring` crypto backend instead of the default `aws-lc-rs`, which needs a C/asm
+# toolchain (NASM/perl) that is awkward on Windows MSVC.
+russh = { version = "0.61", optional = true, default-features = false, features = ["ring", "flate2", "rsa"] }
+# SFTP client (+ server, used by the e2e test) over a russh channel.
+russh-sftp = { version = "2", optional = true }
+
+[build-dependencies]
+# cbindgen runs from build.rs so a global `cbindgen` install is NOT required.
+cbindgen = "0.27"
+
+[dev-dependencies]
+# Used by the in-process russh test server (host-key generation). Matches russh's
+# rand_core 0.10. Only relevant to the `russh`-gated end-to-end test.
+rand = "0.10"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+panic = "unwind" # required: FFI relies on catch_unwind to stop panics at the boundary.
+
+[profile.dev]
+panic = "unwind"

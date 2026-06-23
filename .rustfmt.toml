@@ -1,0 +1,4 @@
+# rustfmt configuration for the Rust core. Defaults are intentional; pinning the
+# edition keeps formatting stable across toolchains.
+edition = "2021"
+max_width = 100
