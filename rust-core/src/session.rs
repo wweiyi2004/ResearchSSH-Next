@@ -97,7 +97,10 @@ enum Command {
         key_path: Option<String>,
         passphrase: Option<Secret>,
     },
-    Fs { request_id: u64, op: FsOp },
+    Fs {
+        request_id: u64,
+        op: FsOp,
+    },
     Shutdown,
 }
 
@@ -185,7 +188,10 @@ impl Session {
         key_path: Option<String>,
         passphrase: Option<Secret>,
     ) -> CoreResult<()> {
-        self.send_cmd(Command::SetPrivateKey { key_path, passphrase })
+        self.send_cmd(Command::SetPrivateKey {
+            key_path,
+            passphrase,
+        })
     }
 
     /// Cancel the in-flight operation (if any). Out-of-band: works even while the

@@ -388,6 +388,7 @@ impl SshProvider for MockProvider {
 fn mock_response(cmd: &str) -> String {
     let line = match cmd {
         "" => String::new(),
+        c if c.contains('\u{3}') => "^C\r\n".to_string(),
         c if c.starts_with("nvidia-smi") => "\
 GPU 0: NVIDIA A100-SXM4-80GB  | 42C |  78W / 400W | 12345MiB / 81920MiB | 37%\r\n\
 GPU 1: NVIDIA A100-SXM4-80GB  | 39C |  61W / 400W |  2048MiB / 81920MiB |  5%\r\n"
@@ -402,6 +403,38 @@ Filesystem      Size  Used Avail Use% Mounted on\r\n\
 scratch          50T   31T   19T  62% /scratch\r\n"
             .to_string(),
         c if c.starts_with("python") => "Python 3.11.8(模拟)\r\n".to_string(),
+        c if c.contains("__RSSH_RESOURCE_BEGIN__") => "\
+__RSSH_RESOURCE_BEGIN__\r\n\
+0, NVIDIA A100-SXM4-80GB, 37, 12345, 81920\r\n\
+1, NVIDIA A100-SXM4-80GB, 5, 2048, 81920\r\n\
+__RSSH_RESOURCE_PROCESSES__\r\n\
+GPU 0, 29418, python train.py, 11840\r\n\
+GPU 1, 18302, python eval.py, 2048\r\n\
+__RSSH_RESOURCE_CPU__\r\n\
+    PID USER     COMMAND         %CPU %MEM\r\n\
+  29418 alice    python          66.2 18.4\r\n\
+  18302 researcher python        21.5  7.1\r\n\
+    911 root     systemd          4.0  1.0\r\n\
+__RSSH_RESOURCE_JOBS__\r\n\
+102934|gpu|train.sh|alice|RUNNING|2:13:05|4|gpu[01-04]\r\n\
+102935|gpu|eval.py|researcher|PENDING|0:00|1|Priority\r\n\
+__RSSH_RESOURCE_DISK__\r\n\
+/dev/nvme0n1|1.8T|0.9T|0.8T|53%|/home\r\n\
+scratch|50T|31T|19T|62%|/scratch\r\n\
+__RSSH_RESOURCE_END__\r\n"
+            .to_string(),
+        c if c.contains("python") && c.contains(".py") => format!(
+            "模拟运行：{c}\r\n\
+             epoch 1/3 - loss=0.420 - device={}\r\n\
+             epoch 2/3 - loss=0.310\r\n\
+             epoch 3/3 - loss=0.260\r\n\
+             done\r\n",
+            if c.contains("CUDA_VISIBLE_DEVICES=''") {
+                "CPU"
+            } else {
+                "GPU"
+            }
+        ),
         c => format!("未找到命令：{c}\r\n"),
     };
     line

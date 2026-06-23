@@ -668,8 +668,8 @@ mod e2e {
     use crate::ffi::{
         rscore_create, rscore_destroy, rscore_session_confirm_host_key, rscore_session_connect,
         rscore_session_create, rscore_session_destroy, rscore_session_disconnect,
-        rscore_session_send, rscore_session_set_password, rscore_session_set_private_key, RsSession,
-        RsSessionConfig,
+        rscore_session_send, rscore_session_set_password, rscore_session_set_private_key,
+        RsSession, RsSessionConfig,
     };
     use crate::provider::RsProviderKind;
     use crate::RsErrorCode;

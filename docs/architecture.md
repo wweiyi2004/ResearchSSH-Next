@@ -127,6 +127,7 @@ QML Connect ─► AppController::connectToServer
 #[async_trait]
 pub trait SshProvider: Send {
     fn set_secret(&mut self, secret: Secret);
+    fn set_private_key(&mut self, key_path: Option<String>, passphrase: Option<Secret>);
     fn set_host_key_gate(&mut self, gate: HostKeyGate);
     fn take_file_provider(&mut self) -> Option<Box<dyn FileProvider>>;
     async fn connect(&mut self, sink: ProviderSink) -> CoreResult<()>;
@@ -139,7 +140,7 @@ pub trait SshProvider: Send {
   research responses (`nvidia-smi`, `squeue`, `df`, `python`), and an error path
   (hosts starting with `fail`).
 * `RusshProvider` (implemented, shell): `src/providers/russh.rs`, compiled with
-  `--features russh`. Real handshake, password auth, host-key confirmation
+  `--features russh`. Real handshake, public-key/password auth, host-key confirmation
   (known_hosts + a UI prompt for unknown hosts), PTY + shell, and bulk streaming.
   Uses the pure-Rust `ring` crypto backend. It also attempts to open an SFTP
   subsystem on a second channel; when available, file ops are backed by
@@ -148,10 +149,10 @@ pub trait SshProvider: Send {
 ## Real SSH / SFTP (`russh`)
 
 Real SSH is compiled with `-DRESEARCHSSH_RUST_FEATURES=russh` (CMake) or
-`cargo build --features russh`. The backend supports password auth, host-key
-confirmation, PTY shell IO and best-effort SFTP. The in-process e2e test verifies
-a real SSH handshake/auth/shell over loopback; SFTP availability depends on the
-server exposing the subsystem.
+`cargo build --features russh`. The backend supports public-key auth, password
+fallback, host-key confirmation, PTY shell IO and best-effort SFTP. The
+in-process e2e tests verify real public-key/password SSH handshakes over
+loopback; SFTP availability depends on the server exposing the subsystem.
 
 Everything above the provider (sessions, FFI, UI) is provider-agnostic.
 
@@ -160,7 +161,7 @@ Everything above the provider (sessions, FFI, UI) is provider-agnostic.
 * VT/ANSI parsing in the Rust core (a `vt` module feeding a real terminal grid).
 * File workflow hardening: chunked large-file read/write, progress UI, and
   operation cancel.
-* Public-key authentication and richer SSH configuration.
+* Richer SSH configuration, ssh-agent support, and keyboard-interactive auth.
 * Port forwarding and multiplexed channels.
 * Real `CredentialStore` backends: Windows Credential Manager, Android Keystore.
 * Android packaging (`aarch64-linux-android`) — see the README toolchain notes.

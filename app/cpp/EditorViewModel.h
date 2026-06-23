@@ -31,6 +31,7 @@ public:
     void beginOpen(const QString &path); // busy=true, remember path
     void setContent(const QString &path, const QByteArray &data); // -> contentLoaded
     void failOpen();
+    void activatePath(const QString &path);
     void beginSave();
     void finishSave(bool ok, const QString &message = {});
     void close();
@@ -38,7 +39,7 @@ public:
 signals:
     void changed();
     // Carries freshly loaded text for the QML editor to display.
-    void contentLoaded(const QString &text);
+    void contentLoaded(const QString &path, const QString &text);
     void saveSucceeded();
     void saveFailed(const QString &message);
 

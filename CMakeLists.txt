@@ -45,6 +45,8 @@ qt_add_executable(researchssh_next
     app/cpp/ServerListModel.h
     app/cpp/TerminalViewModel.cpp
     app/cpp/TerminalViewModel.h
+    app/cpp/CodeHighlighter.cpp
+    app/cpp/CodeHighlighter.h
     app/cpp/RemoteFileTreeModel.cpp
     app/cpp/RemoteFileTreeModel.h
     app/cpp/EditorViewModel.cpp
