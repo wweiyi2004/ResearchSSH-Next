@@ -247,17 +247,31 @@ void AppController::cancel() {
         m_bridge.cancelSession(m_session);
 }
 
+bool AppController::sendTerminalBytes(const QByteArray &payload,
+                                      const QString &failureContext) {
+    const RsErrorCode rc = m_bridge.sendToSession(m_session, payload);
+    if (rc != RsErrorCode_Ok) {
+        m_terminal->appendNotice(
+            QStringLiteral("%1：%2").arg(failureContext, RustCoreBridge::describe(rc)));
+        return false;
+    }
+    return true;
+}
+
+bool AppController::sendShellLine(const QString &line, const QString &failureContext) {
+    QByteArray payload = line.toUtf8();
+    payload.append('\r');
+    return sendTerminalBytes(payload, failureContext);
+}
+
 void AppController::sendCommand(const QString &text) {
     if (!m_session || m_connectionState != RsSessionState_Connected) {
         m_terminal->appendNotice(QStringLiteral("未连接,无法发送命令。"));
         return;
     }
-    QByteArray payload = text.toUtf8();
-    payload.append('\n');
-    const RsErrorCode rc = m_bridge.sendToSession(m_session, payload);
-    if (rc != RsErrorCode_Ok)
-        m_terminal->appendNotice(
-            QStringLiteral("发送失败：%1").arg(RustCoreBridge::describe(rc)));
+    if (text.trimmed().isEmpty())
+        return;
+    sendShellLine(text, QStringLiteral("发送失败"));
 }
 
 void AppController::sendInterrupt() {
@@ -266,11 +280,7 @@ void AppController::sendInterrupt() {
         return;
     }
     const QByteArray payload(1, '\x03');
-    const RsErrorCode rc = m_bridge.sendToSession(m_session, payload);
-    if (rc != RsErrorCode_Ok)
-        m_terminal->appendNotice(
-            QStringLiteral("中止信号发送失败：%1").arg(RustCoreBridge::describe(rc)));
-    else
+    if (sendTerminalBytes(payload, QStringLiteral("中止信号发送失败")))
         m_terminal->appendNotice(QStringLiteral("已发送 Ctrl+C。"));
 }
 
@@ -304,12 +314,18 @@ void AppController::runPythonFile(const QString &path, const QString &device) {
             gpu = gpu.mid(3).trimmed();
         if (gpu.isEmpty())
             gpu = QStringLiteral("0");
+        const QRegularExpression gpuIndexPattern(QStringLiteral("^\\d+$"));
+        if (!gpuIndexPattern.match(gpu).hasMatch()) {
+            m_terminal->appendNotice(QStringLiteral("GPU 编号无效：%1").arg(device));
+            return;
+        }
         envPrefix = QStringLiteral("CUDA_VISIBLE_DEVICES=%1 ").arg(gpu);
         label = QStringLiteral("GPU %1").arg(gpu);
     }
 
     m_terminal->appendNotice(QStringLiteral("运行 %1，目标：%2").arg(path, label));
-    sendCommand(QStringLiteral("%1python %2").arg(envPrefix, shellQuote(path)));
+    sendShellLine(QStringLiteral("%1python %2").arg(envPrefix, shellQuote(path)),
+                  QStringLiteral("运行 Python 失败"));
 }
 
 void AppController::refreshResourceSnapshot() {
@@ -343,7 +359,13 @@ void AppController::refreshResourceSnapshot() {
         "printf '__RSSH_RESOURCE_DISK__\\n'; "
         "df -hP 2>/dev/null | awk 'NR>1 {print $1 \"|\" $2 \"|\" $3 \"|\" $4 \"|\" $5 \"|\" $6}' | head -n 8 || true; "
         "printf '__RSSH_RESOURCE_END__\\n'");
-    sendCommand(command);
+    if (!sendShellLine(command, QStringLiteral("资源快照命令发送失败"))) {
+        m_resourceSnapshotBusy = false;
+        m_resourceCapture.clear();
+        m_resourceMarkerTail.clear();
+        m_resourceSnapshotText = QStringLiteral("资源快照命令发送失败");
+        emit resourceSnapshotChanged();
+    }
 }
 
 void AppController::activateEditorPath(const QString &path) {
@@ -366,8 +388,8 @@ void AppController::ingestRustEvents(const RustEventBatch &batch) {
             setConnectionState(ev.state);
             break;
         case RsEventKind_Data:
-            captureResourceOutput(ev.data);
-            m_terminal->appendBytes(ev.data);
+            if (!captureResourceOutput(ev.data))
+                m_terminal->appendBytes(ev.data);
             break;
         case RsEventKind_Error: {
             const QString msg =
@@ -1073,9 +1095,9 @@ void AppController::parseResourceSnapshot(const QString &text) {
     }
 }
 
-void AppController::captureResourceOutput(const QByteArray &data) {
+bool AppController::captureResourceOutput(const QByteArray &data) {
     if (!m_resourceSnapshotBusy)
-        return;
+        return false;
 
     const QString chunk = QString::fromUtf8(data);
     QString captureChunk = chunk;
@@ -1083,7 +1105,7 @@ void AppController::captureResourceOutput(const QByteArray &data) {
         const QString probe = m_resourceMarkerTail + chunk;
         if (!containsMarkerLine(probe, kResourceBegin)) {
             m_resourceMarkerTail = probe.right(QString::fromLatin1(kResourceBegin).size() + 2);
-            return;
+            return true;
         }
         captureChunk = probe;
         m_resourceMarkerTail.clear();
@@ -1096,7 +1118,7 @@ void AppController::captureResourceOutput(const QByteArray &data) {
         m_resourceCapture.clear();
         m_resourceMarkerTail.clear();
         emit resourceSnapshotChanged();
-        return;
+        return true;
     }
     if (extractMarkedBody(m_resourceCapture, nullptr)) {
         const QString captured = m_resourceCapture;
@@ -1104,6 +1126,7 @@ void AppController::captureResourceOutput(const QByteArray &data) {
         m_resourceMarkerTail.clear();
         parseResourceSnapshot(captured);
     }
+    return true;
 }
 
 void AppController::rebuildResourceProcessGroups() {

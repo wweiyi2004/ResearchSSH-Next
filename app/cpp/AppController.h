@@ -154,7 +154,9 @@ private:
     void setFileStatus(bool available, const QString &text);
     void seedResourceSnapshot(const QString &statusText);
     void parseResourceSnapshot(const QString &text);
-    void captureResourceOutput(const QByteArray &data);
+    bool sendTerminalBytes(const QByteArray &payload, const QString &failureContext);
+    bool sendShellLine(const QString &line, const QString &failureContext);
+    bool captureResourceOutput(const QByteArray &data);
     void rebuildResourceProcessGroups();
 
     // Tracks outstanding file requests so results can be dispatched by id.

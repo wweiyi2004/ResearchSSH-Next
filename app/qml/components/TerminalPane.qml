@@ -12,6 +12,8 @@ Rectangle {
     property bool followOutput: true
     property var completionSuggestions: []
     property string completionPrefix: ""
+    property var commandHistory: []
+    property int historyIndex: -1
     color: Theme.window
 
     readonly property var commandCompletions: [
@@ -80,6 +82,45 @@ Rectangle {
     function outputAtBottom() {
         return !outputScrollBar.visible
                || outputScrollBar.position + outputScrollBar.size >= 0.98
+    }
+
+    function rememberCommand(command) {
+        if (command.trim().length === 0)
+            return
+        var items = root.commandHistory.slice()
+        if (items.length === 0 || items[items.length - 1] !== command)
+            items.push(command)
+        if (items.length > 50)
+            items.shift()
+        root.commandHistory = items
+        root.historyIndex = root.commandHistory.length
+    }
+
+    function submitInput() {
+        var command = input.text
+        if (!root.controller.connected || command.trim().length === 0)
+            return
+        terminalCompletion.close()
+        root.rememberCommand(command)
+        root.controller.sendCommand(command)
+        input.text = ""
+        root.completionSuggestions = []
+        root.completionPrefix = ""
+    }
+
+    function recallHistory(delta) {
+        if (root.commandHistory.length === 0)
+            return
+        var next = root.historyIndex < 0 ? root.commandHistory.length : root.historyIndex
+        next += delta
+        if (next < 0)
+            next = 0
+        if (next > root.commandHistory.length)
+            next = root.commandHistory.length
+        root.historyIndex = next
+        input.text = next === root.commandHistory.length ? "" : root.commandHistory[next]
+        input.cursorPosition = input.text.length
+        terminalCompletion.close()
     }
 
     ColumnLayout {
@@ -159,19 +200,15 @@ Rectangle {
                         border.color: input.activeFocus ? Theme.accent : Theme.border
                         border.width: 1
                     }
-                    onTextEdited: root.updateCompletion(false)
+                    onTextEdited: {
+                        root.historyIndex = root.commandHistory.length
+                        root.updateCompletion(false)
+                    }
                     onCursorPositionChanged: {
                         if (terminalCompletion.opened)
                             root.updateCompletion(false)
                     }
-                    onAccepted: {
-                        if (terminalCompletion.opened) {
-                            root.acceptCompletion(terminalCompletionList.currentIndex)
-                        } else if (text.length > 0) {
-                            root.controller.sendCommand(text)
-                            text = ""
-                        }
-                    }
+                    onAccepted: root.submitInput()
                     Keys.onPressed: function(event) {
                         if (event.key === Qt.Key_Space
                                 && (event.modifiers & Qt.ControlModifier)) {
@@ -179,6 +216,23 @@ Rectangle {
                             event.accepted = true
                         } else if (event.key === Qt.Key_Tab && terminalCompletion.opened) {
                             root.acceptCompletion(terminalCompletionList.currentIndex)
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_Up) {
+                            if (terminalCompletion.opened) {
+                                terminalCompletionList.currentIndex =
+                                        Math.max(0, terminalCompletionList.currentIndex - 1)
+                            } else {
+                                root.recallHistory(-1)
+                            }
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_Down) {
+                            if (terminalCompletion.opened) {
+                                terminalCompletionList.currentIndex =
+                                        Math.min(root.completionSuggestions.length - 1,
+                                                 terminalCompletionList.currentIndex + 1)
+                            } else {
+                                root.recallHistory(1)
+                            }
                             event.accepted = true
                         } else if (event.key === Qt.Key_Escape && terminalCompletion.opened) {
                             terminalCompletion.close()
@@ -197,11 +251,8 @@ Rectangle {
                 StyledButton {
                     text: "发送"
                     primary: true
-                    enabled: root.controller.connected && input.text.length > 0
-                    onClicked: {
-                        root.controller.sendCommand(input.text)
-                        input.text = ""
-                    }
+                    enabled: root.controller.connected && input.text.trim().length > 0
+                    onClicked: root.submitInput()
                 }
             }
 
