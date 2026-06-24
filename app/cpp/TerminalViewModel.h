@@ -38,6 +38,7 @@ signals:
     void textChanged();
 
 private:
+    QString sanitiseTerminalChunk(const QString &chunk);
     void appendText(const QString &chunk);
     void appendLog(const QString &chunk);
 
@@ -47,6 +48,8 @@ private:
     // character split between two reads from the core is decoded correctly instead
     // of turning into replacement characters.
     QStringDecoder m_utf8{QStringDecoder::Utf8};
+    // Retains a partially received ANSI/VT control sequence until the next chunk.
+    QString m_pendingControl;
     // Cap the buffer so a long-running session can't grow it without bound.
     static constexpr int kMaxChars = 200000;
 };
