@@ -16,12 +16,14 @@
 | `russh` provider（真实 SSH：握手、公钥/密码认证、主机密钥确认、PTY+shell） | 已在 `--features russh` 后实现，并通过进程内服务端端到端测试验证 |
 | 连接真实服务器 UI（连接对话框 + 主机密钥确认对话框） | 已实现 |
 | 远程文件管理 + 应用内编辑器（文件树 / 复制粘贴重命名 / 上传 / 编辑保存） | Mock 已实现；已贯通 FFI/C++/QML；`russh` 会在服务端支持时尝试 SFTP |
-| 编辑器/终端效率功能（多文件标签、语法高亮、补全、括号配对、Python 运行目标、资源快照） | 已在 Qt UI 中实现；连接后资源刷新使用 SSH 命令 |
+| 编辑器/终端效率功能（多文件标签、语法高亮、补全、括号配对、Python 运行目标、资源快照） | 已在 Qt UI 中实现；资源快照改走独立 exec 通道 |
 | Rust 单元测试 + FFI 冒烟测试 + Mock 会话测试 | 构建并通过 |
-| C++/Qt 适配层（AppController、models、RustCoreBridge、CredentialStore） | 已实现 |
+| C++/Qt 适配层（AppController、models、RustCoreBridge、CredentialStore） | 已实现；Windows 使用 Credential Manager，其他平台回退 Mock |
 | QML 深色三栏界面（服务器 · 终端 · 工作区标签：连接/文件） | 已实现 |
 | CMake + Cargo 构建、CMakePresets | 已实现 |
 | 公钥认证（默认密钥发现、显式密钥文件、可选口令、密码回退） | 已实现 |
+| 独立 exec 任务通道（非交互命令 stdout/stderr/exit status 回调） | 已实现，供资源快照与包管理使用 |
+| 包/环境面板（环境探测、已安装包、搜索、用户级安装） | MVP 已实现（pip/conda/uv/mamba；系统级安装暂不自动 sudo） |
 | 完整终端模拟器 / 端口转发 | 后续工作 |
 
 ### 本机已验证内容
@@ -29,7 +31,7 @@
 当前使用的工具链：Rust 1.96、Visual Studio 2022 (MSVC 19.44)、CMake 4.3.4、Ninja 1.13.2、**Qt 6.8.3 (msvc2022_64)，安装路径为 `E:\Qt\6.8.3\msvc2022_64`**。
 
 * `cargo build` / `cargo build --release`：通过，已生成 Rust core staticlib。
-* `cargo test`：通过，18 个测试通过（17 个单元测试，包含 FFI/文件冒烟测试；1 个通过 C ABI 驱动完整 Mock 会话的集成 FFI 测试）。
+* `cargo test`：通过，20 个测试通过（含 FFI/文件/exec 冒烟测试；另有 1 个通过 C ABI 驱动完整 Mock 会话的集成 FFI 测试）。
 * `cargo clippy --all-targets -- -D warnings`（默认特性 + `--features russh`）：无告警。
 * `cargo fmt --check`：通过。
 * 通过 `build.rs` 生成 cbindgen 头文件：通过（`rust-core/include/research_ssh_core.h`）。
@@ -144,10 +146,10 @@ ResearchSSH-Next/
 │   │   ├── TerminalViewModel.*  # 终端文本缓冲区
 │   │   ├── RemoteFileTreeModel.*# 懒加载远程文件树
 │   │   ├── EditorViewModel.*    # 应用内远程文本编辑器状态
-│   │   └── CredentialStore.*    # 平台密钥存储抽象（含 Mock）
+│   │   └── CredentialStore.*    # 平台密钥存储抽象（Windows Credential Manager + Mock）
 │   └── qml/
 │       ├── Main.qml             # 深色三栏外壳（ApplicationWindow）
-│       └── components/          # ServerPane、TerminalPane、StatusPane 等组件
+│       └── components/          # ServerPane、TerminalPane、StatusPane、PackagePane 等组件
 ├── rust-core/              # Rust 安全核心
 │   ├── Cargo.toml / Cargo.lock
 │   ├── build.rs                # cbindgen：生成 include/research_ssh_core.h
@@ -189,9 +191,10 @@ ResearchSSH-Next/
 
 1. 用真正的 VT/ANSI 终端网格替换当前占位文本终端。
 2. 改进 SSH 错误报告，并增加 keyboard-interactive / agent 认证。
-3. 增加持久化服务器配置，以及真正的 Windows Credential Manager 后端。
-4. 加固文件编辑：支持大文件/二进制文件处理、进度显示和取消操作。
-5. 增加打包部署（`windeployqt`、安装器）和 UI 测试。
+3. 加固包管理：安装前命令预览/确认、安装日志持久化、spack/module 专用适配器、SSH config 感知。
+4. 增加 Android Keystore 后端，并完善跨设备凭据迁移策略。
+5. 加固文件编辑：支持大文件/二进制文件处理、进度显示和取消操作。
+6. 增加打包部署（`windeployqt`、安装器）和 UI 测试。
 
 ## License
 

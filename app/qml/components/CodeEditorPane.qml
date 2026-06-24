@@ -8,6 +8,8 @@ Rectangle {
     property var controller
     property bool modified: false
     property bool loadingText: false
+    property bool applyingEditorText: false
+    property bool syntaxHighlightPaused: false
     property var openDocuments: []
     property int activeDocumentIndex: -1
     property string pendingOpenPath: ""
@@ -27,11 +29,26 @@ Rectangle {
                                                         && root.activeDocumentIndex < root.openDocuments.length
                                                         && !!root.openDocuments[root.activeDocumentIndex].remoteMissing
     readonly property string currentLanguage: languageForPath(root.activePath)
+    readonly property bool syntaxHighlightEnabled: !root.syntaxHighlightPaused
+                                                   && !root.activeDocumentLoading
+                                                   && root.currentLanguage !== "text"
+                                                   && root.activeDocumentIndex >= 0
+                                                   && root.activeDocumentIndex < root.openDocuments.length
+                                                   && (root.openDocuments[root.activeDocumentIndex].text || "").length <= 350000
     readonly property bool pythonOpen: currentLanguage === "python"
     property var completionSuggestions: []
     property string completionPrefix: ""
 
     color: Theme.editor
+
+    onActiveDocumentIndexChanged: root.syncEditorFromActiveDocument(false)
+
+    Timer {
+        id: syntaxHighlightResumeTimer
+        interval: 120
+        repeat: false
+        onTriggered: root.syntaxHighlightPaused = false
+    }
 
     function requestOpen(path, size) {
         if (!root.controller.fileAvailable)
@@ -74,8 +91,10 @@ Rectangle {
                 && root.modified) {
             if (root.activePath.length > 0)
                 root.controller.activateEditorPath(root.activePath)
+            var savePath = root.activePath
+            var saveText = editorText.text
             root.setActiveSaving(true)
-            root.controller.saveEditor(editorText.text)
+            root.controller.saveEditorPath(savePath, saveText)
         }
     }
 
@@ -107,10 +126,12 @@ Rectangle {
         return -1
     }
 
-    function replaceDocument(index, doc) {
+    function replaceDocument(index, doc, syncActive) {
         var docs = root.openDocuments.slice()
         docs[index] = doc
         root.openDocuments = docs
+        if (!!syncActive && index === root.activeDocumentIndex)
+            root.syncEditorFromActiveDocument(false)
     }
 
     function isIgnoredOpenPath(path) {
@@ -157,6 +178,34 @@ Rectangle {
         root.replaceDocument(root.activeDocumentIndex, doc)
     }
 
+    function syncEditorFromActiveDocument(focusEditor) {
+        if (root.activeDocumentIndex < 0
+                || root.activeDocumentIndex >= root.openDocuments.length) {
+            root.loadingText = true
+            editorText.text = ""
+            root.loadingText = false
+            root.modified = false
+            completionPopup.close()
+            return
+        }
+
+        var doc = root.openDocuments[root.activeDocumentIndex]
+        var nextText = doc.text || ""
+        root.loadingText = true
+        root.applyingEditorText = true
+        root.syntaxHighlightPaused = true
+        syntaxHighlightResumeTimer.stop()
+        editorText.text = nextText
+        editorText.cursorPosition = Math.min(doc.cursorPosition || 0, nextText.length)
+        root.applyingEditorText = false
+        root.loadingText = false
+        root.modified = !!doc.modified
+        syntaxHighlightResumeTimer.restart()
+        completionPopup.close()
+        if (focusEditor)
+            editorText.forceActiveFocus()
+    }
+
     function activateDocument(index, persistCurrent, focusEditor) {
         if (index < 0 || index >= root.openDocuments.length)
             return
@@ -164,15 +213,8 @@ Rectangle {
             root.persistActiveText()
         root.activeDocumentIndex = index
         var doc = root.openDocuments[index]
-        root.loadingText = true
-        editorText.text = doc.text || ""
-        editorText.cursorPosition = Math.min(doc.cursorPosition || 0, editorText.text.length)
-        root.loadingText = false
-        root.modified = !!doc.modified
+        root.syncEditorFromActiveDocument(focusEditor)
         root.controller.activateEditorPath(doc.path)
-        completionPopup.close()
-        if (focusEditor)
-            editorText.forceActiveFocus()
     }
 
     function setActiveDocument(index) {
@@ -219,7 +261,7 @@ Rectangle {
         var wasActive = index === root.activeDocumentIndex
         var doc = root.makeDocument(path, text, false, false)
         if (index >= 0) {
-            root.replaceDocument(index, doc)
+            root.replaceDocument(index, doc, wasActive)
         } else {
             var docs = root.openDocuments.slice()
             docs.push(doc)
@@ -299,6 +341,7 @@ Rectangle {
         var activeIndex = root.findDocumentIndex(oldActivePath)
         if (activeIndex >= 0) {
             root.activeDocumentIndex = activeIndex
+            root.syncEditorFromActiveDocument(false)
             root.modified = !!root.openDocuments[activeIndex].modified
             return
         }
@@ -322,6 +365,7 @@ Rectangle {
         if (!changed)
             return
         root.openDocuments = docs
+        root.syncEditorFromActiveDocument(false)
         if (root.activePath.length > 0)
             root.controller.activateEditorPath(root.activePath)
     }
@@ -881,10 +925,12 @@ Rectangle {
                 placeholderTextColor: Theme.faint
                 background: Rectangle { color: Theme.editor }
                 onTextChanged: {
-                    if (!root.loadingText && root.activeDocumentIndex >= 0
+                    if (!root.loadingText && !root.applyingEditorText
+                            && root.activeDocumentIndex >= 0
                             && !root.activeDocumentLoading)
                         root.setActiveModified(true)
-                    if (!root.loadingText && !root.activeDocumentLoading)
+                    if (!root.loadingText && !root.applyingEditorText
+                            && !root.activeDocumentLoading)
                         root.updateCompletion(false)
                 }
                 onCursorPositionChanged: {
@@ -921,7 +967,7 @@ Rectangle {
 
             CodeHighlighter {
                 textDocument: editorText.textDocument
-                language: root.currentLanguage
+                language: root.syntaxHighlightEnabled ? root.currentLanguage : ""
                 darkTheme: Theme.dark
             }
 

@@ -55,6 +55,18 @@ struct FsResult {
 };
 using FsResultBatch = QVector<FsResult>;
 
+// One side-channel command result, copied out of a transient RsExecResult.
+struct ExecResult {
+    quint64 requestId = 0;
+    int kind = 0; // RsExecResultKind (Output/Error)
+    QByteArray stdoutData;
+    QByteArray stderrData;
+    int exitStatus = -1;
+    int errorCode = 0;
+    QString message;
+};
+using ExecResultBatch = QVector<ExecResult>;
+
 class RustCoreBridge {
 public:
     RustCoreBridge();
@@ -101,6 +113,8 @@ public:
 
     // Register the file-result callback (file results go to receiver->ingestFileResults).
     RsErrorCode setFileCallback(RsSession *session, QObject *receiver);
+    // Register the side-channel command callback.
+    RsErrorCode setExecCallback(RsSession *session, QObject *receiver);
 
     // File operations. Each returns a request id (0 = could not queue); the result
     // arrives later via the file callback.
@@ -111,11 +125,13 @@ public:
     quint64 fsRemove(RsSession *session, const QString &path, bool recursive);
     quint64 fsMkdir(RsSession *session, const QString &path);
     quint64 fsCopy(RsSession *session, const QString &from, const QString &to);
+    quint64 exec(RsSession *session, const QString &command, quint64 timeoutMs);
 
 private:
     // C ABI callbacks. Invoked on arbitrary Rust threads; copy + queue to UI.
     static void onRustEvents(void *user_data, const RsEvent *events, uintptr_t count);
     static void onFileResults(void *user_data, const RsFsResult *results, uintptr_t count);
+    static void onExecResults(void *user_data, const RsExecResult *results, uintptr_t count);
 
     RsCore *m_core = nullptr;
 };

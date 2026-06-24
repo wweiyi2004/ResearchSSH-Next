@@ -1,6 +1,6 @@
 [package]
 name = "research_ssh_core"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Rust security core for ResearchSSH-Next (SSH/SFTP, sessions, async scheduling) exposed over a stable C ABI."

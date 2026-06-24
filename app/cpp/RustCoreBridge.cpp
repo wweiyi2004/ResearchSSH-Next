@@ -112,6 +112,11 @@ RsErrorCode RustCoreBridge::setFileCallback(RsSession *session, QObject *receive
                                             static_cast<void *>(receiver));
 }
 
+RsErrorCode RustCoreBridge::setExecCallback(RsSession *session, QObject *receiver) {
+    return rscore_session_set_exec_callback(session, &RustCoreBridge::onExecResults,
+                                            static_cast<void *>(receiver));
+}
+
 quint64 RustCoreBridge::fsList(RsSession *session, const QString &path) {
     return rscore_session_fs_list(session, path.toUtf8().constData());
 }
@@ -140,6 +145,42 @@ quint64 RustCoreBridge::fsMkdir(RsSession *session, const QString &path) {
 
 quint64 RustCoreBridge::fsCopy(RsSession *session, const QString &from, const QString &to) {
     return rscore_session_fs_copy(session, from.toUtf8().constData(), to.toUtf8().constData());
+}
+
+quint64 RustCoreBridge::exec(RsSession *session, const QString &command, quint64 timeoutMs) {
+    return rscore_session_exec(session, command.toUtf8().constData(), timeoutMs);
+}
+
+void RustCoreBridge::onExecResults(void *user_data, const RsExecResult *results, uintptr_t count) {
+    auto *receiver = static_cast<AppController *>(user_data);
+    if (!receiver || !results)
+        return;
+
+    ExecResultBatch batch;
+    batch.reserve(static_cast<qsizetype>(count));
+    for (uintptr_t i = 0; i < count; ++i) {
+        const RsExecResult &r = results[i];
+        ExecResult out;
+        out.requestId = r.request_id;
+        out.kind = static_cast<int>(r.kind);
+        out.exitStatus = r.exit_status;
+        out.errorCode = static_cast<int>(r.error_code);
+        if (r.stdout_data && r.stdout_len > 0) {
+            out.stdoutData = QByteArray(reinterpret_cast<const char *>(r.stdout_data),
+                                        static_cast<qsizetype>(r.stdout_len));
+        }
+        if (r.stderr_data && r.stderr_len > 0) {
+            out.stderrData = QByteArray(reinterpret_cast<const char *>(r.stderr_data),
+                                        static_cast<qsizetype>(r.stderr_len));
+        }
+        if (r.message)
+            out.message = QString::fromUtf8(r.message);
+        batch.push_back(std::move(out));
+    }
+
+    QMetaObject::invokeMethod(
+        receiver, [receiver, batch]() { receiver->ingestExecResults(batch); },
+        Qt::QueuedConnection);
 }
 
 void RustCoreBridge::onFileResults(void *user_data, const RsFsResult *results, uintptr_t count) {

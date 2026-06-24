@@ -10,6 +10,7 @@
 #pragma once
 
 #include <QHash>
+#include <QNetworkAccessManager>
 #include <QObject>
 #include <QUrl>
 #include <QVariantList>
@@ -30,8 +31,13 @@ class AppController : public QObject {
     Q_PROPERTY(TerminalViewModel *terminal READ terminal CONSTANT)
     Q_PROPERTY(RemoteFileTreeModel *fileTree READ fileTree CONSTANT)
     Q_PROPERTY(EditorViewModel *editor READ editor CONSTANT)
+    Q_PROPERTY(QString appVersion READ appVersion CONSTANT)
     Q_PROPERTY(QString coreVersion READ coreVersion CONSTANT)
     Q_PROPERTY(QString credentialBackend READ credentialBackend CONSTANT)
+    Q_PROPERTY(QString updateStatusText READ updateStatusText NOTIFY updateStateChanged)
+    Q_PROPERTY(bool updateBusy READ updateBusy NOTIFY updateStateChanged)
+    Q_PROPERTY(bool updateAvailable READ updateAvailable NOTIFY updateStateChanged)
+    Q_PROPERTY(QString updateDownloadUrl READ updateDownloadUrl NOTIFY updateStateChanged)
     Q_PROPERTY(int selectedIndex READ selectedIndex NOTIFY selectedIndexChanged)
     Q_PROPERTY(int connectionState READ connectionState NOTIFY connectionStateChanged)
     Q_PROPERTY(QString connectionStateText READ connectionStateText NOTIFY connectionStateChanged)
@@ -52,6 +58,12 @@ class AppController : public QObject {
     Q_PROPERTY(QVariantList resourceDisks READ resourceDisks NOTIFY resourceSnapshotChanged)
     Q_PROPERTY(QString resourceSnapshotText READ resourceSnapshotText NOTIFY resourceSnapshotChanged)
     Q_PROPERTY(bool resourceSnapshotBusy READ resourceSnapshotBusy NOTIFY resourceSnapshotChanged)
+    Q_PROPERTY(QVariantList packageTools READ packageTools NOTIFY packageStateChanged)
+    Q_PROPERTY(QVariantList installedPackages READ installedPackages NOTIFY packageStateChanged)
+    Q_PROPERTY(QVariantList packageSearchResults READ packageSearchResults NOTIFY packageStateChanged)
+    Q_PROPERTY(QString packageStatusText READ packageStatusText NOTIFY packageStateChanged)
+    Q_PROPERTY(QString packageLogText READ packageLogText NOTIFY packageStateChanged)
+    Q_PROPERTY(bool packageBusy READ packageBusy NOTIFY packageStateChanged)
 
 public:
     explicit AppController(QObject *parent = nullptr);
@@ -64,11 +76,14 @@ public:
     void ingestRustEvents(const RustEventBatch &batch);
     // Called by RustCoreBridge on the UI thread with a batch of file results.
     void ingestFileResults(const FsResultBatch &batch);
+    // Called by RustCoreBridge on the UI thread with side-channel command results.
+    void ingestExecResults(const ExecResultBatch &batch);
 
     ServerListModel *serverModel() { return m_servers; }
     TerminalViewModel *terminal() { return m_terminal; }
     RemoteFileTreeModel *fileTree() { return m_fileTree; }
     EditorViewModel *editor() { return m_editor; }
+    QString appVersion() const;
     QString coreVersion() const { return RustCoreBridge::version(); }
     QString credentialBackend() const {
         return m_credentials ? m_credentials->backendName() : QStringLiteral("none");
@@ -96,8 +111,20 @@ public:
     QVariantList resourceDisks() const { return m_resourceDisks; }
     QString resourceSnapshotText() const { return m_resourceSnapshotText; }
     bool resourceSnapshotBusy() const { return m_resourceSnapshotBusy; }
+    QVariantList packageTools() const { return m_packageTools; }
+    QVariantList installedPackages() const { return m_installedPackages; }
+    QVariantList packageSearchResults() const { return m_packageSearchResults; }
+    QString packageStatusText() const { return m_packageStatusText; }
+    QString packageLogText() const { return m_packageLogText; }
+    bool packageBusy() const { return m_packageBusy; }
+    QString updateStatusText() const { return m_updateStatusText; }
+    bool updateBusy() const { return m_updateBusy; }
+    bool updateAvailable() const { return m_updateAvailable; }
+    QString updateDownloadUrl() const { return m_updateDownloadUrl; }
 
 public slots:
+    void checkForUpdates();
+    void openUpdateDownload();
     void selectServer(int index);
     void connectToServer(int index);
     // Add a real (russh) server from the connection dialog and connect to it. The
@@ -106,6 +133,9 @@ public slots:
     void connectToHost(const QString &host, int port, const QString &username,
                        const QString &password, const QString &name,
                        const QString &keyPath, const QString &keyPassphrase);
+    void editServer(int index, const QString &host, int port, const QString &username,
+                    const QString &password, const QString &name, const QString &keyPath,
+                    const QString &keyPassphrase);
     void deleteServer(int index);
     void disconnectCurrent();
     void cancel();
@@ -117,6 +147,11 @@ public slots:
     void clearTerminal();
     void runPythonFile(const QString &path, const QString &device);
     void refreshResourceSnapshot();
+    void refreshEnvironment();
+    void searchPackages(const QString &query);
+    void installPackage(const QString &manager, const QString &name);
+    void updatePackage(const QString &manager, const QString &name);
+    void removePackage(const QString &manager, const QString &name);
     void activateEditorPath(const QString &path);
     void closeEditor();
 
@@ -132,6 +167,7 @@ public slots:
     void makeFile(const QString &parentDir, const QString &name);
     void uploadFile(const QString &destDir, const QUrl &localFile);
     void saveEditor(const QString &text);
+    void saveEditorPath(const QString &path, const QString &text);
 
 signals:
     void selectedIndexChanged();
@@ -141,6 +177,8 @@ signals:
     void fileStatusChanged();
     void clipboardChanged();
     void resourceSnapshotChanged();
+    void packageStateChanged();
+    void updateStateChanged();
     // Emitted when the server presents an unknown host key needing confirmation.
     void hostKeyPromptRequested(const QString &fingerprint);
 
@@ -157,10 +195,17 @@ private:
     void setFileStatus(bool available, const QString &text);
     void seedResourceSnapshot(const QString &statusText);
     void parseResourceSnapshot(const QString &text);
+    void parseEnvironmentProbe(const QString &text);
+    void parseInstalledPackages(const QString &text);
+    void parsePackageSearch(const QString &text);
+    void finishUpdateCheck(const QByteArray &payload, const QString &networkError);
+    void finishPackageMutation(const ExecResult &result, const QString &successText,
+                               const QString &failureText, const QString &refreshText);
     bool sendTerminalBytes(const QByteArray &payload, const QString &failureContext);
     bool sendShellLine(const QString &line, const QString &failureContext);
     bool captureResourceOutput(const QByteArray &data);
     void rebuildResourceProcessGroups();
+    quint64 submitExec(const QString &command, quint64 timeoutMs, int kind, const QString &label);
 
     // Tracks outstanding file requests so results can be dispatched by id.
     struct PendingFs {
@@ -192,6 +237,30 @@ private:
     bool m_resourceSnapshotBusy = false;
     QString m_resourceCapture;
     QString m_resourceMarkerTail;
+    QVariantList m_packageTools;
+    QVariantList m_installedPackages;
+    QVariantList m_packageSearchResults;
+    QString m_packageStatusText = QStringLiteral("连接后可扫描环境");
+    QString m_packageLogText;
+    bool m_packageBusy = false;
+    QString m_updateStatusText = QStringLiteral("尚未检查热更新");
+    QString m_updateDownloadUrl;
+    bool m_updateBusy = false;
+    bool m_updateAvailable = false;
+    struct PendingExec {
+        enum Kind {
+            ResourceSnapshot,
+            EnvironmentProbe,
+            PackageList,
+            PackageSearch,
+            PackageInstall,
+            PackageUpdate,
+            PackageRemove
+        }
+            kind = EnvironmentProbe;
+        QString label;
+    };
+    QHash<quint64, PendingExec> m_execPending;
 
     RustCoreBridge m_bridge;
     ServerListModel *m_servers = nullptr;
@@ -199,6 +268,7 @@ private:
     RemoteFileTreeModel *m_fileTree = nullptr;
     EditorViewModel *m_editor = nullptr;
     std::unique_ptr<CredentialStore> m_credentials;
+    QNetworkAccessManager *m_updateNetwork = nullptr;
 
     RsSession *m_session = nullptr;
     int m_currentIndex = -1; // server bound to the active session

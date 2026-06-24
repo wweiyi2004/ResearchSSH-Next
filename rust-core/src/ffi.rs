@@ -31,7 +31,8 @@ use crate::fs::{FileKind, FilePayload, FileResult};
 use crate::provider::ConnectionConfig;
 use crate::runtime::CoreRuntime;
 use crate::secret::Secret;
-use crate::session::{EventEmitter, FileEmitter, Session};
+use crate::session::{EventEmitter, FileEmitter, Session, TaskEmitter};
+use crate::task::{ExecPayload, ExecResult};
 use crate::{CoreResult, RsErrorCode};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -798,6 +799,146 @@ impl FileEmitter for FfiFileEmitter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Side-channel command C ABI.
+// ---------------------------------------------------------------------------
+
+/// Discriminator for [`RsExecResult`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsExecResultKind {
+    /// stdout/stderr/exit_status are valid.
+    Output = 0,
+    /// error_code/message are valid.
+    Error = 1,
+}
+
+/// Result of one side-channel command, correlated by `request_id`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RsExecResult {
+    /// Matches the id returned by `rscore_session_exec`.
+    pub request_id: u64,
+    /// Which fields are valid.
+    pub kind: RsExecResultKind,
+    /// Captured stdout bytes.
+    pub stdout_data: *const u8,
+    /// Length of stdout.
+    pub stdout_len: usize,
+    /// Captured stderr bytes.
+    pub stderr_data: *const u8,
+    /// Length of stderr.
+    pub stderr_len: usize,
+    /// Process exit status, or -1 if unavailable.
+    pub exit_status: i32,
+    /// Error code (valid when `kind == Error`).
+    pub error_code: RsErrorCode,
+    /// UTF-8 error message (valid when `kind == Error`).
+    pub message: *const c_char,
+}
+
+/// Side-channel command callback: receives a batch of `count` results.
+pub type RsExecCallback =
+    extern "C" fn(user_data: *mut c_void, results: *const RsExecResult, count: usize);
+
+struct ExecCallbackTarget {
+    cb: RsExecCallback,
+    user_data: *mut c_void,
+}
+
+// SAFETY: same contract as `CallbackTarget`.
+unsafe impl Send for ExecCallbackTarget {}
+unsafe impl Sync for ExecCallbackTarget {}
+
+struct FfiTaskEmitter {
+    target: ExecCallbackTarget,
+    active: Mutex<bool>,
+}
+
+impl TaskEmitter for FfiTaskEmitter {
+    fn deactivate(&self) {
+        *self.active.lock().expect("task emitter active lock") = false;
+    }
+
+    fn emit_task_results(&self, results: Vec<ExecResult>) {
+        if results.is_empty() {
+            return;
+        }
+
+        let to_cstring = |s: String| CString::new(s.replace('\0', "?")).unwrap_or_default();
+        let mut cstrings: Vec<CString> = Vec::new();
+        let mut byte_bufs: Vec<Vec<u8>> = Vec::new();
+
+        enum Rec {
+            Output {
+                stdout: usize,
+                stderr: usize,
+                exit_status: i32,
+            },
+            Error(RsErrorCode, usize),
+        }
+        let mut recs: Vec<(u64, Rec)> = Vec::with_capacity(results.len());
+        for r in results {
+            let rec = match r.payload {
+                ExecPayload::Output(output) => {
+                    byte_bufs.push(output.stdout);
+                    let stdout = byte_bufs.len() - 1;
+                    byte_bufs.push(output.stderr);
+                    let stderr = byte_bufs.len() - 1;
+                    Rec::Output {
+                        stdout,
+                        stderr,
+                        exit_status: output.exit_status,
+                    }
+                }
+                ExecPayload::Error { code, message } => {
+                    cstrings.push(to_cstring(message));
+                    Rec::Error(code, cstrings.len() - 1)
+                }
+            };
+            recs.push((r.request_id, rec));
+        }
+
+        let mut c_results: Vec<RsExecResult> = Vec::with_capacity(recs.len());
+        for (request_id, rec) in &recs {
+            let result = match rec {
+                Rec::Output {
+                    stdout,
+                    stderr,
+                    exit_status,
+                } => RsExecResult {
+                    request_id: *request_id,
+                    kind: RsExecResultKind::Output,
+                    stdout_data: byte_bufs[*stdout].as_ptr(),
+                    stdout_len: byte_bufs[*stdout].len(),
+                    stderr_data: byte_bufs[*stderr].as_ptr(),
+                    stderr_len: byte_bufs[*stderr].len(),
+                    exit_status: *exit_status,
+                    error_code: RsErrorCode::Ok,
+                    message: ptr::null(),
+                },
+                Rec::Error(code, message) => RsExecResult {
+                    request_id: *request_id,
+                    kind: RsExecResultKind::Error,
+                    stdout_data: ptr::null(),
+                    stdout_len: 0,
+                    stderr_data: ptr::null(),
+                    stderr_len: 0,
+                    exit_status: -1,
+                    error_code: *code,
+                    message: cstrings[*message].as_ptr(),
+                },
+            };
+            c_results.push(result);
+        }
+
+        let active = self.active.lock().expect("task emitter active lock");
+        if *active {
+            (self.target.cb)(self.target.user_data, c_results.as_ptr(), c_results.len());
+        }
+    }
+}
+
 fn guard_u64<F: FnOnce() -> u64>(f: F) -> u64 {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(0)
 }
@@ -830,12 +971,52 @@ pub extern "C" fn rscore_session_set_file_callback(
     })
 }
 
+/// Registers the side-channel command callback for a session.
+#[no_mangle]
+pub extern "C" fn rscore_session_set_exec_callback(
+    session: *mut RsSession,
+    cb: Option<extern "C" fn(user_data: *mut c_void, results: *const RsExecResult, count: usize)>,
+    user_data: *mut c_void,
+) -> RsErrorCode {
+    guard_code(|| {
+        let cb = match cb {
+            Some(cb) => cb,
+            None => return RsErrorCode::NullArgument,
+        };
+        // SAFETY: `session` must be a live handle.
+        match unsafe { session.as_ref() } {
+            Some(s) => {
+                let emitter: Arc<dyn TaskEmitter> = Arc::new(FfiTaskEmitter {
+                    target: ExecCallbackTarget { cb, user_data },
+                    active: Mutex::new(true),
+                });
+                s.session.set_task_emitter(emitter);
+                RsErrorCode::Ok
+            }
+            None => RsErrorCode::NullArgument,
+        }
+    })
+}
+
 fn fs_with_session<F: FnOnce(&Session) -> u64>(session: *mut RsSession, f: F) -> u64 {
     // SAFETY: `session` must be a live handle.
     match unsafe { session.as_ref() } {
         Some(s) => f(&s.session),
         None => 0,
     }
+}
+
+/// Runs a non-interactive command on a side channel. Returns a request id.
+#[no_mangle]
+pub extern "C" fn rscore_session_exec(
+    session: *mut RsSession,
+    command: *const c_char,
+    timeout_ms: u64,
+) -> u64 {
+    guard_u64(|| match cstr_to_string(command) {
+        Ok(cmd) => fs_with_session(session, |s| s.exec(cmd, timeout_ms)),
+        Err(_) => 0,
+    })
 }
 
 /// Lists a directory (empty `path` = the connection's home dir). Returns a request id.
@@ -1110,6 +1291,11 @@ mod tests {
         results: Mutex<Vec<(u64, String)>>,
     }
 
+    #[derive(Default)]
+    struct ExecCollector {
+        results: Mutex<Vec<(u64, i32, String, String)>>,
+    }
+
     extern "C" fn noop_events(_u: *mut c_void, _e: *const RsEvent, _c: usize) {}
 
     extern "C" fn fs_collect(user_data: *mut c_void, results: *const RsFsResult, count: usize) {
@@ -1137,6 +1323,33 @@ mod tests {
                 RsFsResultKind::Error => "error".to_string(),
             };
             c.results.lock().unwrap().push((r.request_id, summary));
+        }
+    }
+
+    extern "C" fn exec_collect(user_data: *mut c_void, results: *const RsExecResult, count: usize) {
+        let c = unsafe { &*(user_data as *const ExecCollector) };
+        let rs = unsafe { std::slice::from_raw_parts(results, count) };
+        for r in rs {
+            let stdout = if !r.stdout_data.is_null() && r.stdout_len > 0 {
+                let d = unsafe { std::slice::from_raw_parts(r.stdout_data, r.stdout_len) };
+                String::from_utf8_lossy(d).into_owned()
+            } else {
+                String::new()
+            };
+            let stderr = if !r.stderr_data.is_null() && r.stderr_len > 0 {
+                let d = unsafe { std::slice::from_raw_parts(r.stderr_data, r.stderr_len) };
+                String::from_utf8_lossy(d).into_owned()
+            } else if !r.message.is_null() {
+                unsafe { CStr::from_ptr(r.message) }
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                String::new()
+            };
+            c.results
+                .lock()
+                .unwrap()
+                .push((r.request_id, r.exit_status, stdout, stderr));
         }
     }
 
@@ -1209,5 +1422,53 @@ mod tests {
         let list2 = find(id_list2);
         assert!(list2.contains("note.txt"), "list2: {list2}");
         assert!(list2.contains("newdir"), "list2: {list2}");
+    }
+
+    #[test]
+    fn ffi_exec_pipeline_over_mock() {
+        let mut err = RsErrorCode::Internal;
+        let core = rscore_create(&mut err);
+        assert!(!core.is_null());
+
+        let collector = ExecCollector::default();
+        let host = CString::new("hpc.example.edu").unwrap();
+        let user = CString::new("researcher").unwrap();
+        let config = RsSessionConfig {
+            host: host.as_ptr(),
+            port: 22,
+            username: user.as_ptr(),
+            provider: RsProviderKind::Mock,
+        };
+        let session =
+            rscore_session_create(core, &config, Some(noop_events), ptr::null_mut(), &mut err);
+        assert!(!session.is_null());
+
+        assert_eq!(
+            rscore_session_set_exec_callback(
+                session,
+                Some(exec_collect),
+                &collector as *const ExecCollector as *mut c_void,
+            ),
+            RsErrorCode::Ok
+        );
+        assert_eq!(rscore_session_connect(session), RsErrorCode::Ok);
+
+        let probe = CString::new("__RSSH_ENV_PROBE__").unwrap();
+        let request_id = rscore_session_exec(session, probe.as_ptr(), 1000);
+        assert_ne!(request_id, 0);
+
+        std::thread::sleep(Duration::from_millis(500));
+        rscore_session_destroy(session);
+        rscore_destroy(core);
+
+        let results = collector.results.lock().unwrap();
+        let (_, exit, stdout, stderr) = results
+            .iter()
+            .find(|(id, _, _, _)| *id == request_id)
+            .expect("exec result");
+        assert_eq!(*exit, 0);
+        assert!(stderr.is_empty(), "stderr: {stderr}");
+        assert!(stdout.contains("tool:pip="), "stdout: {stdout}");
+        assert!(stdout.contains("__RSSH_ENV_DONE__"), "stdout: {stdout}");
     }
 }

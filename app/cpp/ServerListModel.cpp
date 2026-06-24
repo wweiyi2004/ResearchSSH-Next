@@ -32,6 +32,8 @@ QVariant ServerListModel::data(const QModelIndex &index, int role) const {
         return statusText(item.status);
     case EndpointRole:
         return QStringLiteral("%1@%2:%3").arg(item.username, item.host).arg(item.port);
+    case KeyPathRole:
+        return item.keyPath;
     default:
         return {};
     }
@@ -39,10 +41,11 @@ QVariant ServerListModel::data(const QModelIndex &index, int role) const {
 
 QHash<int, QByteArray> ServerListModel::roleNames() const {
     return {
-        {NameRole, "name"},         {HostRole, "host"},
-        {PortRole, "port"},         {UsernameRole, "username"},
-        {ProviderRole, "provider"}, {StatusRole, "status"},
+        {NameRole, "name"},             {HostRole, "host"},
+        {PortRole, "port"},             {UsernameRole, "username"},
+        {ProviderRole, "provider"},     {StatusRole, "status"},
         {StatusTextRole, "statusText"}, {EndpointRole, "endpoint"},
+        {KeyPathRole, "keyPath"},
     };
 }
 
@@ -62,6 +65,29 @@ int ServerListModel::addServer(const QString &name, const QString &host, int por
     });
     endInsertRows();
     return row;
+}
+
+bool ServerListModel::updateServer(int row, const QString &name, const QString &host, int port,
+                                   const QString &username, int provider,
+                                   const QString &keyPath) {
+    if (!isValidIndex(row) || host.trimmed().isEmpty() || username.trimmed().isEmpty() ||
+        port <= 0 || port > 65535) {
+        return false;
+    }
+
+    ServerItem &item = m_items[row];
+    item.name = name.trimmed().isEmpty() ? host.trimmed() : name.trimmed();
+    item.host = host.trimmed();
+    item.port = static_cast<quint16>(port);
+    item.username = username.trimmed();
+    item.provider = provider == static_cast<int>(RsProviderKind_Mock) ? RsProviderKind_Mock
+                                                                      : RsProviderKind_Russh;
+    item.keyPath = keyPath.trimmed();
+
+    const QModelIndex idx = index(row, 0);
+    emit dataChanged(idx, idx, {NameRole, HostRole, PortRole, UsernameRole, ProviderRole,
+                                EndpointRole, KeyPathRole});
+    return true;
 }
 
 bool ServerListModel::removeServer(int row) {

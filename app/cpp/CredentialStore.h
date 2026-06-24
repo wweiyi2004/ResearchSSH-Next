@@ -9,8 +9,8 @@
 //   * Android  -> Android Keystore (via JNI)
 //   * Fallback -> in-memory MockCredentialStore (framework stage / tests)
 //
-// Only the Mock backend is implemented at the framework stage; the real backends
-// are wired in later behind the same interface (see createDefaultCredentialStore).
+// createDefaultCredentialStore returns the best available backend for the
+// current platform and falls back to Mock where a native backend is not present.
 
 #pragma once
 
@@ -59,8 +59,7 @@ private:
     QHash<QString, QByteArray> m_secrets;
 };
 
-// Factory: returns the best available backend for the current platform. At the
-// framework stage this is always the Mock backend.
+// Factory: returns the best available backend for the current platform.
 std::unique_ptr<CredentialStore> createDefaultCredentialStore();
 
 } // namespace researchssh

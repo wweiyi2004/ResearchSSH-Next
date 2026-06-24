@@ -7,6 +7,7 @@
 
 use crate::secret::Secret;
 use crate::session::HostKeyGate;
+use crate::task::ExecOutput;
 use crate::{CoreError, CoreResult};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -100,6 +101,16 @@ pub trait SshProvider: Send {
 
     /// Send bytes to the remote (e.g. a command or keystrokes).
     async fn send(&mut self, data: &[u8]) -> CoreResult<()>;
+
+    /// Run one non-interactive command on a separate channel and capture its
+    /// stdout/stderr. Providers that cannot open a side channel return
+    /// [`RsErrorCode::ProviderUnavailable`](crate::RsErrorCode::ProviderUnavailable).
+    async fn exec(&mut self, _command: &str, _timeout_ms: u64) -> CoreResult<ExecOutput> {
+        Err(CoreError::with_detail(
+            crate::RsErrorCode::ProviderUnavailable,
+            "side-channel exec is unavailable for this provider",
+        ))
+    }
 
     /// Disconnect cleanly. Should be idempotent.
     async fn disconnect(&mut self) -> CoreResult<()>;
