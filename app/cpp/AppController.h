@@ -106,6 +106,7 @@ public slots:
     void connectToHost(const QString &host, int port, const QString &username,
                        const QString &password, const QString &name,
                        const QString &keyPath, const QString &keyPassphrase);
+    void deleteServer(int index);
     void disconnectCurrent();
     void cancel();
     // Deliver the user's host-key confirmation decision.
@@ -146,6 +147,8 @@ signals:
 private:
     void setConnectionState(RsSessionState state);
     void teardownSession();
+    void loadServers();
+    void saveServers() const;
     QString endpointFor(int index) const;
     void expandDir(const QString &path); // RemoteFileTreeModel::directoryExpandRequested
     static QString parentDirOf(const QString &path);

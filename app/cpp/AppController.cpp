@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSettings>
 #include <QStringDecoder>
 #include <QVariantMap>
 
@@ -134,15 +135,16 @@ AppController::~AppController() {
 bool AppController::initialize(QString *errorOut) {
     if (!m_bridge.initialize(errorOut))
         return false;
-    m_servers->seedDemoServers();
+    loadServers();
     if (m_servers->count() > 0)
         selectServer(0);
     m_terminal->appendNotice(
         QStringLiteral("ResearchSSH-Next 核心 %1 就绪(凭据后端：%2)。")
             .arg(RustCoreBridge::version(), credentialBackend()));
-    m_terminal->appendNotice(QStringLiteral(
-        "请选择左侧服务器并点击“连接”。当前为模拟 Provider；主机名以 “fail” 开头的条目"
-        "用于演示连接失败的错误流程。"));
+    m_terminal->appendNotice(
+        m_servers->count() > 0
+            ? QStringLiteral("已加载 %1 个 SSH 服务器。").arg(m_servers->count())
+            : QStringLiteral("点击左侧“添加服务器”添加 SSH 服务器。"));
     return true;
 }
 
@@ -222,7 +224,47 @@ void AppController::connectToHost(const QString &host, int port, const QString &
     if (!keyPassphrase.isEmpty())
         m_credentials->store(endpoint + QStringLiteral("#keypass"), keyPassphrase.toUtf8());
 
+    saveServers();
     connectToServer(index);
+}
+
+void AppController::deleteServer(int index) {
+    if (!m_servers->isValidIndex(index))
+        return;
+
+    const QString endpoint = endpointFor(index);
+    const bool deletingCurrentSession = index == m_currentIndex;
+
+    if (deletingCurrentSession) {
+        teardownSession();
+        m_connectionState = RsSessionState_Idle;
+        emit connectionStateChanged();
+        if (!m_currentEndpoint.isEmpty()) {
+            m_currentEndpoint.clear();
+            emit currentEndpointChanged();
+        }
+    } else if (m_currentIndex > index) {
+        --m_currentIndex;
+    }
+
+    m_credentials->remove(endpoint);
+    m_credentials->remove(endpoint + QStringLiteral("#keypass"));
+
+    if (!m_servers->removeServer(index))
+        return;
+    saveServers();
+
+    int nextSelected = m_selectedIndex;
+    if (m_selectedIndex == index)
+        nextSelected = m_servers->count() == 0 ? -1 : qMin(index, m_servers->count() - 1);
+    else if (m_selectedIndex > index)
+        --nextSelected;
+    if (nextSelected != m_selectedIndex || m_selectedIndex == index) {
+        m_selectedIndex = nextSelected;
+        emit selectedIndexChanged();
+    }
+
+    m_terminal->appendNotice(QStringLiteral("已删除服务器：%1").arg(endpoint));
 }
 
 void AppController::confirmHostKey(bool accept) {
@@ -762,6 +804,40 @@ void AppController::teardownSession() {
     m_fileTree->clearTree();
     m_editor->removePath({}, true);
     m_currentIndex = -1;
+}
+
+void AppController::loadServers() {
+    QSettings settings;
+    const int size = settings.beginReadArray(QStringLiteral("servers"));
+    for (int i = 0; i < size; ++i) {
+        settings.setArrayIndex(i);
+        const QString host = settings.value(QStringLiteral("host")).toString().trimmed();
+        const QString username =
+            settings.value(QStringLiteral("username")).toString().trimmed();
+        if (host.isEmpty() || username.isEmpty())
+            continue;
+        const QString name = settings.value(QStringLiteral("name")).toString();
+        const int port = settings.value(QStringLiteral("port"), 22).toInt();
+        const QString keyPath = settings.value(QStringLiteral("keyPath")).toString();
+        m_servers->addServer(name, host, port, username,
+                             static_cast<int>(RsProviderKind_Russh), keyPath);
+    }
+    settings.endArray();
+}
+
+void AppController::saveServers() const {
+    QSettings settings;
+    settings.beginWriteArray(QStringLiteral("servers"));
+    for (int i = 0; i < m_servers->count(); ++i) {
+        const ServerItem &item = m_servers->itemAt(i);
+        settings.setArrayIndex(i);
+        settings.setValue(QStringLiteral("name"), item.name);
+        settings.setValue(QStringLiteral("host"), item.host);
+        settings.setValue(QStringLiteral("port"), item.port);
+        settings.setValue(QStringLiteral("username"), item.username);
+        settings.setValue(QStringLiteral("keyPath"), item.keyPath);
+    }
+    settings.endArray();
 }
 
 QString AppController::endpointFor(int index) const {

@@ -4,7 +4,7 @@ import QtQuick.Dialogs
 import QtQuick.Layouts
 import ResearchSSH
 
-// "新建 SSH 连接" dialog. Collects host/port/user/password and asks the controller
+// "添加 SSH 服务器" dialog. Collects host/port/user/password and asks the controller
 // to open a real (russh) session. The password is handed to C++ and never kept in
 // QML state beyond this field.
 Dialog {
@@ -53,7 +53,7 @@ Dialog {
             Layout.topMargin: 16
             Layout.leftMargin: 18
             Layout.rightMargin: 18
-            text: "新建 SSH 连接"
+            text: "添加 SSH 服务器"
             color: Theme.text
             font.pixelSize: 16
             font.bold: true

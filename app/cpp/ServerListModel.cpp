@@ -46,24 +46,6 @@ QHash<int, QByteArray> ServerListModel::roleNames() const {
     };
 }
 
-void ServerListModel::seedDemoServers() {
-    beginResetModel();
-    m_items = {
-        ServerItem{QStringLiteral("HPC 登录节点"), QStringLiteral("login.hpc.example.edu"), 22,
-                   QStringLiteral("researcher"), RsProviderKind_Mock, RsSessionState_Idle},
-        ServerItem{QStringLiteral("GPU 集群"), QStringLiteral("gpu.cluster.example.edu"), 22,
-                   QStringLiteral("alice"), RsProviderKind_Mock, RsSessionState_Idle},
-        ServerItem{QStringLiteral("实验室工作站"), QStringLiteral("ws-lab-07.example.edu"),
-                   2222, QStringLiteral("bob"), RsProviderKind_Mock, RsSessionState_Idle},
-        // Hosts starting with "fail" are rejected by the mock provider — this row
-        // exists to demonstrate the error state in the UI.
-        ServerItem{QStringLiteral("无法连接(错误演示)"),
-                   QStringLiteral("fail.offline.example.edu"), 22, QStringLiteral("nobody"),
-                   RsProviderKind_Mock, RsSessionState_Idle},
-    };
-    endResetModel();
-}
-
 int ServerListModel::addServer(const QString &name, const QString &host, int port,
                                const QString &username, int provider, const QString &keyPath) {
     const int row = static_cast<int>(m_items.size());
@@ -73,13 +55,22 @@ int ServerListModel::addServer(const QString &name, const QString &host, int por
         host,
         static_cast<quint16>(port),
         username,
-        provider == static_cast<int>(RsProviderKind_Russh) ? RsProviderKind_Russh
-                                                           : RsProviderKind_Mock,
+        provider == static_cast<int>(RsProviderKind_Mock) ? RsProviderKind_Mock
+                                                          : RsProviderKind_Russh,
         RsSessionState_Idle,
         keyPath,
     });
     endInsertRows();
     return row;
+}
+
+bool ServerListModel::removeServer(int row) {
+    if (!isValidIndex(row))
+        return false;
+    beginRemoveRows(QModelIndex(), row, row);
+    m_items.removeAt(row);
+    endRemoveRows();
+    return true;
 }
 
 void ServerListModel::setStatus(int row, RsSessionState status) {
