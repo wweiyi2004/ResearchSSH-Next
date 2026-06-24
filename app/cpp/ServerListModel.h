@@ -37,6 +37,7 @@ public:
         StatusRole,
         StatusTextRole,
         EndpointRole, // "user@host:port"
+        KeyPathRole,
     };
     Q_ENUM(Roles)
 
@@ -59,6 +60,9 @@ public:
     Q_INVOKABLE int addServer(const QString &name, const QString &host, int port,
                               const QString &username, int provider,
                               const QString &keyPath = QString());
+    Q_INVOKABLE bool updateServer(int row, const QString &name, const QString &host, int port,
+                                  const QString &username, int provider,
+                                  const QString &keyPath = QString());
 
     static QString statusText(int status);
 

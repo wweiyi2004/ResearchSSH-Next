@@ -25,6 +25,7 @@ pub mod providers;
 pub mod runtime;
 pub mod secret;
 pub mod session;
+pub mod task;
 
 // The FFI module is the ONLY place allowed to use `unsafe`.
 #[allow(unsafe_code)]

@@ -15,6 +15,7 @@ use crate::provider::{
     create_provider, ConnectionConfig, ProviderEvent, ProviderSink, SshProvider,
 };
 use crate::secret::Secret;
+use crate::task::{ExecPayload, ExecResult};
 use crate::{CoreError, CoreResult, RsErrorCode};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,6 +76,15 @@ pub trait FileEmitter: Send + Sync {
     fn deactivate(&self) {}
 }
 
+/// Sink for delivering side-channel command results to the FFI task callback.
+pub trait TaskEmitter: Send + Sync {
+    /// Deliver a batch of command results (one callback per call).
+    fn emit_task_results(&self, results: Vec<ExecResult>);
+
+    /// See [`EventEmitter::deactivate`].
+    fn deactivate(&self) {}
+}
+
 /// A file operation requested over the C ABI; carried with its request id.
 enum FsOp {
     List(String),
@@ -101,12 +111,20 @@ enum Command {
         request_id: u64,
         op: FsOp,
     },
+    Exec {
+        request_id: u64,
+        command: String,
+        timeout_ms: u64,
+    },
     Shutdown,
 }
 
 /// Shared slot for the optional file-result emitter (set after the FFI registers a
 /// file callback).
 type FileEmitterSlot = Arc<Mutex<Option<Arc<dyn FileEmitter>>>>;
+
+/// Shared slot for the optional side-channel task emitter.
+type TaskEmitterSlot = Arc<Mutex<Option<Arc<dyn TaskEmitter>>>>;
 
 /// Handle to a running session. Cloning is intentionally not provided; the FFI
 /// layer owns exactly one boxed `Session` per `RsSession*`.
@@ -118,6 +136,7 @@ pub struct Session {
     host_key_pending: HostKeyPending,
     next_request_id: AtomicU64,
     file_emitter: FileEmitterSlot,
+    task_emitter: TaskEmitterSlot,
     /// Kept so teardown can deactivate the event sink even if the driver task is
     /// still running (see [`Session::shutdown_and_join`]).
     emitter: Arc<dyn EventEmitter>,
@@ -136,6 +155,8 @@ impl Session {
         };
         let file_emitter: FileEmitterSlot = Arc::new(Mutex::new(None));
         let file_emitter_driver = file_emitter.clone();
+        let task_emitter: TaskEmitterSlot = Arc::new(Mutex::new(None));
+        let task_emitter_driver = task_emitter.clone();
         // Retained on the handle so teardown can deactivate it; the driver task gets
         // its own clone moved in below.
         let emitter_for_session = emitter.clone();
@@ -147,6 +168,7 @@ impl Session {
                 cancel_driver,
                 gate,
                 file_emitter_driver,
+                task_emitter_driver,
             )
             .await;
         });
@@ -158,6 +180,7 @@ impl Session {
             host_key_pending,
             next_request_id: AtomicU64::new(0),
             file_emitter,
+            task_emitter,
             emitter: emitter_for_session,
         }
     }
@@ -214,6 +237,11 @@ impl Session {
         *self.file_emitter.lock().expect("file emitter lock") = Some(emitter);
     }
 
+    /// Register the side-channel task-result emitter.
+    pub fn set_task_emitter(&self, emitter: Arc<dyn TaskEmitter>) {
+        *self.task_emitter.lock().expect("task emitter lock") = Some(emitter);
+    }
+
     /// Monotonic, never-zero request id.
     fn next_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1
@@ -264,6 +292,23 @@ impl Session {
         self.submit_fs(FsOp::Copy(from, to))
     }
 
+    /// Run a non-interactive command on a side channel and capture its output.
+    pub fn exec(&self, command: String, timeout_ms: u64) -> u64 {
+        let id = self.next_id();
+        if self
+            .cmd_tx
+            .send(Command::Exec {
+                request_id: id,
+                command,
+                timeout_ms,
+            })
+            .is_err()
+        {
+            return 0;
+        }
+        id
+    }
+
     fn send_cmd(&self, cmd: Command) -> CoreResult<()> {
         self.cmd_tx.send(cmd).map_err(|_| {
             CoreError::with_detail(RsErrorCode::RuntimeError, "session driver stopped")
@@ -295,6 +340,9 @@ impl Session {
         if let Some(em) = self.file_emitter.lock().expect("file emitter lock").take() {
             em.deactivate();
         }
+        if let Some(em) = self.task_emitter.lock().expect("task emitter lock").take() {
+            em.deactivate();
+        }
     }
 }
 
@@ -312,6 +360,7 @@ async fn drive(
     cancel: Arc<Notify>,
     gate: HostKeyGate,
     file_emitter: FileEmitterSlot,
+    task_emitter: TaskEmitterSlot,
 ) {
     let (prov_tx, mut prov_rx) = mpsc::unbounded_channel::<ProviderEvent>();
     let sink = ProviderSink::new(prov_tx);
@@ -429,6 +478,36 @@ async fn drive(
                             em.emit_file_results(vec![result]);
                         }
                     }
+                    Some(Command::Exec { request_id, command, timeout_ms }) => {
+                        let result = if state != RsSessionState::Connected {
+                            ExecResult {
+                                request_id,
+                                payload: ExecPayload::Error {
+                                    code: RsErrorCode::NotConnected,
+                                    message: "cannot execute while not connected".into(),
+                                },
+                            }
+                        } else {
+                            match run_until_cancel(
+                                run_exec_op(&mut provider, request_id, command, timeout_ms),
+                                &cancel,
+                            )
+                            .await
+                            {
+                                Some(r) => r,
+                                None => ExecResult {
+                                    request_id,
+                                    payload: ExecPayload::Error {
+                                        code: RsErrorCode::Cancelled,
+                                        message: "command cancelled".into(),
+                                    },
+                                },
+                            }
+                        };
+                        if let Some(em) = task_emitter.lock().expect("task emitter lock").clone() {
+                            em.emit_task_results(vec![result]);
+                        }
+                    }
                 }
             }
 
@@ -449,6 +528,25 @@ async fn drive(
                 }
             }
         }
+    }
+}
+
+async fn run_exec_op(
+    provider: &mut Box<dyn SshProvider>,
+    request_id: u64,
+    command: String,
+    timeout_ms: u64,
+) -> ExecResult {
+    let payload = match provider.exec(&command, timeout_ms).await {
+        Ok(output) => ExecPayload::Output(output),
+        Err(e) => ExecPayload::Error {
+            code: e.code,
+            message: e.message(),
+        },
+    };
+    ExecResult {
+        request_id,
+        payload,
     }
 }
 

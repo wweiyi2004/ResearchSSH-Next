@@ -87,6 +87,34 @@ Rectangle {
                         }
                     }
                 }
+
+                TabButton {
+                    id: packageTab
+                    width: Math.max(128, packageLabel.implicitWidth + 34)
+                    contentItem: Text {
+                        id: packageLabel
+                        text: "包"
+                        color: packageTab.checked ? Theme.text : Theme.muted
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        font.pixelSize: 13
+                    }
+                    background: Rectangle {
+                        color: packageTab.checked ? Theme.tabActive : Theme.tabInactive
+                        Rectangle {
+                            anchors.top: parent.top
+                            width: parent.width
+                            height: 2
+                            color: packageTab.checked ? Theme.accentStrong : "transparent"
+                        }
+                        Rectangle {
+                            anchors.right: parent.right
+                            width: 1
+                            height: parent.height
+                            color: Theme.borderSubtle
+                        }
+                    }
+                }
             }
 
             Rectangle {
@@ -111,6 +139,12 @@ Rectangle {
 
             CodeEditorPane {
                 id: editorPane
+                controller: root.controller
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+            }
+
+            PackagePane {
                 controller: root.controller
                 Layout.fillWidth: true
                 Layout.fillHeight: true

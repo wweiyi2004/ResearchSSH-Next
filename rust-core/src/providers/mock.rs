@@ -11,6 +11,7 @@
 use crate::fs::{looks_like_text, FileEntry, FileKind, FileProvider};
 use crate::provider::{ConnectionConfig, ProviderEvent, ProviderSink, SshProvider};
 use crate::secret::Secret;
+use crate::task::ExecOutput;
 use crate::{CoreError, CoreResult, RsErrorCode};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -377,6 +378,14 @@ impl SshProvider for MockProvider {
         Ok(())
     }
 
+    async fn exec(&mut self, command: &str, _timeout_ms: u64) -> CoreResult<ExecOutput> {
+        if !self.connected {
+            return Err(CoreError::new(RsErrorCode::NotConnected));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        Ok(mock_exec_output(command))
+    }
+
     async fn disconnect(&mut self) -> CoreResult<()> {
         self.connected = false;
         self.sink = None;
@@ -440,6 +449,76 @@ __RSSH_RESOURCE_END__\r\n"
     line
 }
 
+fn mock_exec_output(cmd: &str) -> ExecOutput {
+    let stdout = if cmd.contains("__RSSH_ENV_PROBE__") {
+        "\
+__RSSH_ENV_PROBE__
+os=Ubuntu 22.04.4 LTS
+kernel=5.15.0-mock
+arch=x86_64
+tool:apt=/usr/bin/apt
+tool:python=/usr/bin/python3
+tool:pip=/usr/bin/pip
+tool:conda=/opt/conda/bin/conda
+tool:module=/usr/bin/module
+version:python=Python 3.11.8
+version:cuda=12.2
+version:gcc=gcc (Ubuntu 11.4.0) 11.4.0
+__RSSH_ENV_DONE__
+"
+        .to_string()
+    } else if cmd.contains("__RSSH_PKG_LIST__") {
+        "\
+__RSSH_PKG_LIST__
+pip|numpy|1.26.4
+pip|torch|2.3.1
+pip|transformers|4.41.2
+conda|python|3.11.8
+conda|cuda-toolkit|12.2
+apt|git|1:2.34.1
+apt|cmake|3.22.1
+module|cuda/12.2|loaded
+module|gcc/11.4|available
+__RSSH_PKG_DONE__
+"
+        .to_string()
+    } else if cmd.contains("__RSSH_PKG_SEARCH__") {
+        let query = cmd
+            .split("__RSSH_PKG_SEARCH__")
+            .nth(1)
+            .unwrap_or_default()
+            .trim();
+        format!(
+            "\
+__RSSH_PKG_SEARCH_RESULTS__
+pip|{query}|latest|PyPI package candidate
+conda|{query}|latest|Conda package candidate
+module|{query}/latest|available|Environment module candidate
+__RSSH_PKG_SEARCH_DONE__
+"
+        )
+    } else if cmd.contains("__RSSH_PKG_ACTION__") || cmd.contains("__RSSH_PKG_INSTALL__") {
+        "\
+__RSSH_PKG_ACTION__
+Resolving package...
+Downloading metadata...
+Applying package operation...
+Operation complete.
+__RSSH_PKG_ACTION_DONE__
+"
+        .to_string()
+    } else if cmd.starts_with("python --version") {
+        "Python 3.11.8\n".to_string()
+    } else {
+        format!("mock exec: {cmd}\n")
+    };
+    ExecOutput {
+        stdout: stdout.into_bytes(),
+        stderr: Vec::new(),
+        exit_status: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +559,20 @@ mod tests {
             }
             _ => panic!("expected data echo"),
         }
+    }
+
+    #[tokio::test]
+    async fn exec_returns_environment_probe_output() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = ProviderSink::new(tx);
+        let mut p = MockProvider::new(cfg("hpc.example.edu"));
+        p.connect(sink).await.expect("connect ok");
+
+        let output = p.exec("__RSSH_ENV_PROBE__", 1000).await.expect("exec ok");
+        assert_eq!(output.exit_status, 0);
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("tool:pip="));
+        assert!(text.contains("version:python="));
     }
 
     #[tokio::test]

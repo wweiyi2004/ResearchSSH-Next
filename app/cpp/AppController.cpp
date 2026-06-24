@@ -1,20 +1,77 @@
 #include "AppController.h"
 
+#include <QCoreApplication>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStringDecoder>
+#include <QStringList>
+#include <QVersionNumber>
 #include <QVariantMap>
 
 namespace researchssh {
+
+#ifndef RESEARCHSSH_APP_VERSION
+#define RESEARCHSSH_APP_VERSION "0.0.0"
+#endif
+
+#ifndef RESEARCHSSH_UPDATE_REPO
+#define RESEARCHSSH_UPDATE_REPO "wweiyi2004/ResearchSSH-Next"
+#endif
 
 namespace {
 
 constexpr quint64 kEditorReadLimit = 2 * 1024 * 1024;
 constexpr auto kResourceBegin = "__RSSH_RESOURCE_BEGIN__";
 constexpr auto kResourceEnd = "__RSSH_RESOURCE_END__";
+
+QString versionWithoutPrefix(QString version) {
+    version = version.trimmed();
+    while (version.startsWith(QLatin1Char('v')) || version.startsWith(QLatin1Char('V')))
+        version.remove(0, 1);
+    return version;
+}
+
+QString preferredReleaseDownloadUrl(const QJsonArray &assets, const QString &htmlUrl) {
+    QString firstUrl;
+    QString zipUrl;
+    QString installerUrl;
+
+    for (const QJsonValue &value : assets) {
+        const QJsonObject asset = value.toObject();
+        const QString name = asset.value(QStringLiteral("name")).toString();
+        const QString url = asset.value(QStringLiteral("browser_download_url")).toString();
+        if (url.isEmpty())
+            continue;
+        if (firstUrl.isEmpty())
+            firstUrl = url;
+        const QString lower = name.toLower();
+        if (zipUrl.isEmpty() && lower.endsWith(QStringLiteral(".zip")))
+            zipUrl = url;
+        if (installerUrl.isEmpty() &&
+            (lower.contains(QStringLiteral("setup")) ||
+             lower.contains(QStringLiteral("installer")) || lower.endsWith(QStringLiteral(".msi")) ||
+             lower.endsWith(QStringLiteral(".exe")))) {
+            installerUrl = url;
+        }
+    }
+
+    if (!installerUrl.isEmpty())
+        return installerUrl;
+    if (!zipUrl.isEmpty())
+        return zipUrl;
+    if (!firstUrl.isEmpty())
+        return firstUrl;
+    return htmlUrl;
+}
 
 QString baseNameOf(const QString &path) {
     const QString trimmed = path.endsWith('/') && path.size() > 1 ? path.left(path.size() - 1)
@@ -66,6 +123,194 @@ QString shellQuote(const QString &value) {
     QString quoted = value;
     quoted.replace('\'', QStringLiteral("'\\''"));
     return QStringLiteral("'%1'").arg(quoted);
+}
+
+enum class PackageAction { Install, Update, Remove };
+
+QString packageActionName(PackageAction action) {
+    switch (action) {
+    case PackageAction::Install:
+        return QStringLiteral("install");
+    case PackageAction::Update:
+        return QStringLiteral("update");
+    case PackageAction::Remove:
+        return QStringLiteral("remove");
+    }
+    return QStringLiteral("install");
+}
+
+bool isPipManager(const QString &manager) {
+    return manager == QStringLiteral("pip") || manager == QStringLiteral("pip3");
+}
+
+bool isCondaManager(const QString &manager) {
+    return manager == QStringLiteral("conda") || manager == QStringLiteral("mamba");
+}
+
+bool isSystemPackageManager(const QString &manager) {
+    return manager == QStringLiteral("apt") || manager == QStringLiteral("dnf") ||
+           manager == QStringLiteral("yum") || manager == QStringLiteral("pacman") ||
+           manager == QStringLiteral("zypper");
+}
+
+bool isNpmManager(const QString &manager) {
+    return manager == QStringLiteral("npm");
+}
+
+bool canInstallPackageManager(const QString &manager) {
+    return isPipManager(manager) || manager == QStringLiteral("uv") || isCondaManager(manager) ||
+           isSystemPackageManager(manager) || isNpmManager(manager);
+}
+
+bool canUpdatePackageManager(const QString &manager) {
+    return canInstallPackageManager(manager);
+}
+
+bool canRemovePackageManager(const QString &manager) {
+    return isPipManager(manager) || manager == QStringLiteral("uv") || isCondaManager(manager) ||
+           isSystemPackageManager(manager) || isNpmManager(manager);
+}
+
+QString packageListCommand() {
+    return QStringLiteral(
+        "printf '__RSSH_PKG_LIST__\\n'; "
+        "if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then "
+        "PY=python3; command -v python3 >/dev/null 2>&1 || PY=python; "
+        "\"$PY\" -m pip list --format=freeze 2>/dev/null | awk -F'==' 'NF>=2 {print \"pip|\" $1 \"|\" $2}' | head -n 160; "
+        "fi; "
+        "if command -v conda >/dev/null 2>&1; then conda list 2>/dev/null | awk 'NF>=2 && $1 !~ /^#/ {print \"conda|\" $1 \"|\" $2}' | head -n 160; fi; "
+        "if command -v mamba >/dev/null 2>&1 && ! command -v conda >/dev/null 2>&1; then mamba list 2>/dev/null | awk 'NF>=2 && $1 !~ /^#/ {print \"mamba|\" $1 \"|\" $2}' | head -n 160; fi; "
+        "if command -v apt >/dev/null 2>&1; then apt list --installed 2>/dev/null | awk -F'[ /]' 'NR>1 {print \"apt|\" $1 \"|\" $3}' | head -n 160; fi; "
+        "if command -v dnf >/dev/null 2>&1; then dnf -q list installed 2>/dev/null | awk 'NF>=2 {name=$1; sub(/\\.[^.]+$/, \"\", name); print \"dnf|\" name \"|\" $2}' | head -n 160; fi; "
+        "if command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1; then yum -q list installed 2>/dev/null | awk 'NF>=2 {name=$1; sub(/\\.[^.]+$/, \"\", name); print \"yum|\" name \"|\" $2}' | head -n 160; fi; "
+        "if command -v pacman >/dev/null 2>&1; then pacman -Q 2>/dev/null | awk 'NF>=2 {print \"pacman|\" $1 \"|\" $2}' | head -n 160; fi; "
+        "if command -v zypper >/dev/null 2>&1; then zypper --non-interactive search --installed-only 2>/dev/null | awk -F'|' '$2 ~ /[A-Za-z0-9_.+-]/ {gsub(/^[ \\t]+|[ \\t]+$/, \"\", $2); gsub(/^[ \\t]+|[ \\t]+$/, \"\", $4); print \"zypper|\" $2 \"|\" $4}' | head -n 160; fi; "
+        "if command -v npm >/dev/null 2>&1; then npm list -g --depth=0 --parseable 2>/dev/null | awk -F'/node_modules/' 'NF>=2 {print \"npm|\" $2 \"|global\"}' | head -n 120; fi; "
+        "if command -v module >/dev/null 2>&1; then module list 2>&1 | sed 's/^[[:space:]]*//' | grep -E '^[0-9]+\\)' | sed 's/^[0-9]*)[[:space:]]*/module|/; s/$/|loaded/' | head -n 80; fi; "
+        "printf '__RSSH_PKG_DONE__\\n'");
+}
+
+QString packageSearchCommand(const QString &query) {
+    const QString quoted = shellQuote(query);
+    return QStringLiteral(
+               "printf '__RSSH_PKG_SEARCH__ %s\\n' %1; "
+               "if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then "
+               "PY=python3; command -v python3 >/dev/null 2>&1 || PY=python; "
+               "\"$PY\" -m pip index versions %1 2>/dev/null | awk -v q=%1 'NR==1 {ver=$0; sub(/^[^(]*\\(/, \"\", ver); sub(/\\).*/, \"\", ver); if (ver == \"\") ver=\"latest\"; print \"pip|\" q \"|\" ver \"|PyPI\"; exit}'; "
+               "fi; "
+               "if command -v conda >/dev/null 2>&1; then conda search %1 2>/dev/null | awk 'NF>=2 && $1 !~ /^#/ {print \"conda|\" $1 \"|\" $2 \"|Conda\"; count++; if (count>=12) exit}'; fi; "
+               "if command -v mamba >/dev/null 2>&1; then mamba search %1 2>/dev/null | awk 'NF>=2 && $1 !~ /^#/ {print \"mamba|\" $1 \"|\" $2 \"|Mamba\"; count++; if (count>=12) exit}'; fi; "
+               "if command -v apt-cache >/dev/null 2>&1; then apt-cache search --names-only %1 2>/dev/null | awk -F' - ' 'NF>=1 {print \"apt|\" $1 \"|available|\" $2}' | head -n 12; fi; "
+               "if command -v dnf >/dev/null 2>&1; then dnf -q search %1 2>/dev/null | awk 'NF>=1 && $1 !~ /:$/ {name=$1; sub(/\\.[^.]+$/, \"\", name); print \"dnf|\" name \"|available|\" $0; count++; if (count>=12) exit}'; fi; "
+               "if command -v yum >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1; then yum -q search %1 2>/dev/null | awk 'NF>=1 && $1 !~ /:$/ {name=$1; sub(/\\.[^.]+$/, \"\", name); print \"yum|\" name \"|available|\" $0; count++; if (count>=12) exit}'; fi; "
+               "if command -v pacman >/dev/null 2>&1; then pacman -Ss %1 2>/dev/null | awk '/^[^ ]/ {split($1,a,\"/\"); print \"pacman|\" a[2] \"|\" $2 \"|\" $1; count++; if (count>=12) exit}'; fi; "
+               "if command -v zypper >/dev/null 2>&1; then zypper --non-interactive search %1 2>/dev/null | awk -F'|' '$2 ~ /[A-Za-z0-9_.+-]/ {gsub(/^[ \\t]+|[ \\t]+$/, \"\", $2); gsub(/^[ \\t]+|[ \\t]+$/, \"\", $4); print \"zypper|\" $2 \"|\" $4 \"|zypper\"; count++; if (count>=12) exit}'; fi; "
+               "if command -v npm >/dev/null 2>&1; then npm search --parseable %1 2>/dev/null | awk -F'\\t' 'NF>=1 {print \"npm|\" $1 \"|\" $4 \"|\" $2; count++; if (count>=12) exit}'; fi; "
+               "if command -v module >/dev/null 2>&1; then module avail %1 2>&1 | sed 's/^[[:space:]]*//' | grep -E '.+' | head -n 8 | sed 's/^/module|/'; fi; "
+               "printf '__RSSH_PKG_SEARCH_DONE__\\n'")
+        .arg(quoted);
+}
+
+QString packageMutationCommand(PackageAction action, const QString &manager,
+                               const QString &packageName) {
+    const QString quoted = shellQuote(packageName);
+    QString operation;
+    if (isPipManager(manager)) {
+        if (action == PackageAction::Remove) {
+            operation = QStringLiteral(
+                            "PY=python3; command -v python3 >/dev/null 2>&1 || PY=python; "
+                            "\"$PY\" -m pip uninstall -y %1 2>&1")
+                            .arg(quoted);
+        } else {
+            operation = QStringLiteral(
+                            "PY=python3; command -v python3 >/dev/null 2>&1 || PY=python; "
+                            "\"$PY\" -m pip install --user --upgrade %1 2>&1")
+                            .arg(quoted);
+        }
+    } else if (manager == QStringLiteral("uv")) {
+        operation = action == PackageAction::Remove
+                        ? QStringLiteral("uv pip uninstall %1 2>&1").arg(quoted)
+                        : QStringLiteral("uv pip install --upgrade %1 2>&1").arg(quoted);
+    } else if (isCondaManager(manager)) {
+        const QString verb = action == PackageAction::Install
+                                 ? QStringLiteral("install")
+                                 : (action == PackageAction::Update ? QStringLiteral("update")
+                                                                    : QStringLiteral("remove"));
+        operation = QStringLiteral("%1 %2 -y %3 2>&1").arg(manager, verb, quoted);
+    } else if (manager == QStringLiteral("apt")) {
+        const QString verb = action == PackageAction::Install
+                                 ? QStringLiteral("install -y")
+                                 : (action == PackageAction::Update
+                                        ? QStringLiteral("install -y --only-upgrade")
+                                        : QStringLiteral("remove -y"));
+        operation = QStringLiteral(
+                        "[ \"$(id -u 2>/dev/null || echo 1)\" -eq 0 ] || "
+                        "{ echo 'system package changes require a root session' >&2; exit 126; }; "
+                        "env DEBIAN_FRONTEND=noninteractive apt-get %1 %2 2>&1")
+                        .arg(verb, quoted);
+    } else if (manager == QStringLiteral("dnf") || manager == QStringLiteral("yum")) {
+        const QString verb = action == PackageAction::Install
+                                 ? QStringLiteral("install")
+                                 : (action == PackageAction::Update ? QStringLiteral("upgrade")
+                                                                    : QStringLiteral("remove"));
+        operation = QStringLiteral(
+                        "[ \"$(id -u 2>/dev/null || echo 1)\" -eq 0 ] || "
+                        "{ echo 'system package changes require a root session' >&2; exit 126; }; "
+                        "%1 -y %2 %3 2>&1")
+                        .arg(manager, verb, quoted);
+    } else if (manager == QStringLiteral("pacman")) {
+        const QString verb = action == PackageAction::Remove ? QStringLiteral("-R")
+                                                             : QStringLiteral("-S");
+        operation = QStringLiteral(
+                        "[ \"$(id -u 2>/dev/null || echo 1)\" -eq 0 ] || "
+                        "{ echo 'system package changes require a root session' >&2; exit 126; }; "
+                        "pacman %1 --noconfirm %2 2>&1")
+                        .arg(verb, quoted);
+    } else if (manager == QStringLiteral("zypper")) {
+        const QString verb = action == PackageAction::Install
+                                 ? QStringLiteral("install")
+                                 : (action == PackageAction::Update ? QStringLiteral("update")
+                                                                    : QStringLiteral("remove"));
+        operation = QStringLiteral(
+                        "[ \"$(id -u 2>/dev/null || echo 1)\" -eq 0 ] || "
+                        "{ echo 'system package changes require a root session' >&2; exit 126; }; "
+                        "zypper --non-interactive %1 %2 2>&1")
+                        .arg(verb, quoted);
+    } else if (manager == QStringLiteral("npm")) {
+        const QString verb = action == PackageAction::Install
+                                 ? QStringLiteral("install")
+                                 : (action == PackageAction::Update ? QStringLiteral("update")
+                                                                    : QStringLiteral("uninstall"));
+        operation = QStringLiteral("npm %1 -g %2 2>&1").arg(verb, quoted);
+    }
+    if (operation.isEmpty())
+        return {};
+
+    return QStringLiteral(
+               "printf '__RSSH_PKG_ACTION__ %s %s %s\\n' %1 %2 %3; "
+               "%4; rc=$?; "
+               "printf '__RSSH_PKG_ACTION_DONE__\\n'; exit $rc")
+        .arg(shellQuote(packageActionName(action)), shellQuote(manager), quoted, operation);
+}
+
+QString tailForUi(const QString &text, qsizetype limit = 1800) {
+    QString trimmed = text.trimmed();
+    if (trimmed.size() <= limit)
+        return trimmed;
+    return QStringLiteral("...\n%1").arg(trimmed.right(limit));
+}
+
+bool packageAlreadyInstalled(const QVariantList &packages, const QString &manager,
+                             const QString &name) {
+    for (const QVariant &value : packages) {
+        const QVariantMap pkg = value.toMap();
+        if (pkg.value(QStringLiteral("manager")).toString().compare(manager, Qt::CaseInsensitive) ==
+                0 &&
+            pkg.value(QStringLiteral("name")).toString().compare(name, Qt::CaseInsensitive) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int clampPercent(double value) {
@@ -148,6 +393,46 @@ bool AppController::initialize(QString *errorOut) {
     return true;
 }
 
+QString AppController::appVersion() const {
+    return QStringLiteral(RESEARCHSSH_APP_VERSION);
+}
+
+void AppController::checkForUpdates() {
+    if (m_updateBusy)
+        return;
+
+    if (!m_updateNetwork)
+        m_updateNetwork = new QNetworkAccessManager(this);
+
+    m_updateBusy = true;
+    m_updateAvailable = false;
+    m_updateDownloadUrl.clear();
+    m_updateStatusText = QStringLiteral("正在检查热更新...");
+    emit updateStateChanged();
+
+    const QString repo = QStringLiteral(RESEARCHSSH_UPDATE_REPO);
+    QNetworkRequest request(QUrl(QStringLiteral("https://api.github.com/repos/%1/releases/latest")
+                                    .arg(repo)));
+    request.setHeader(QNetworkRequest::UserAgentHeader,
+                      QStringLiteral("ResearchSSH-Next/%1").arg(appVersion()));
+    request.setRawHeader("Accept", "application/vnd.github+json");
+
+    QNetworkReply *reply = m_updateNetwork->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        const QNetworkReply::NetworkError error = reply->error();
+        const QByteArray payload = reply->readAll();
+        const QString message = error == QNetworkReply::NoError ? QString() : reply->errorString();
+        reply->deleteLater();
+        finishUpdateCheck(payload, message);
+    });
+}
+
+void AppController::openUpdateDownload() {
+    if (m_updateDownloadUrl.isEmpty())
+        return;
+    QDesktopServices::openUrl(QUrl(m_updateDownloadUrl));
+}
+
 void AppController::selectServer(int index) {
     if (!m_servers->isValidIndex(index) || index == m_selectedIndex)
         return;
@@ -183,6 +468,10 @@ void AppController::connectToServer(int index) {
         if (fsRc != RsErrorCode_Ok)
             m_terminal->appendNotice(
                 QStringLiteral("注册文件回调失败：%1").arg(RustCoreBridge::describe(fsRc)));
+        const RsErrorCode execRc = m_bridge.setExecCallback(m_session, this);
+        if (execRc != RsErrorCode_Ok)
+            m_terminal->appendNotice(
+                QStringLiteral("注册任务回调失败：%1").arg(RustCoreBridge::describe(execRc)));
 
         // Demonstrate the secure credential path: a stored secret (if any) is sent
         // straight to the core's zeroizing buffer — it never passes through QML.
@@ -226,6 +515,71 @@ void AppController::connectToHost(const QString &host, int port, const QString &
 
     saveServers();
     connectToServer(index);
+}
+
+void AppController::editServer(int index, const QString &host, int port, const QString &username,
+                               const QString &password, const QString &name,
+                               const QString &keyPath, const QString &keyPassphrase) {
+    if (!m_servers->isValidIndex(index))
+        return;
+    const QString cleanHost = host.trimmed();
+    const QString cleanUser = username.trimmed();
+    const quint16 p = port > 0 ? static_cast<quint16>(port) : 22;
+    if (cleanHost.isEmpty() || cleanUser.isEmpty() || port <= 0 || port > 65535) {
+        m_terminal->appendNotice(QStringLiteral("服务器配置无效：主机、用户名和端口不能为空。"));
+        return;
+    }
+
+    const QString oldEndpoint = endpointFor(index);
+    const QString newEndpoint = QStringLiteral("%1@%2:%3").arg(cleanUser, cleanHost).arg(p);
+    const bool endpointChanged = oldEndpoint != newEndpoint;
+    const bool editingCurrentSession = index == m_currentIndex;
+
+    const bool hadPassword = m_credentials->contains(oldEndpoint);
+    const QByteArray oldPassword = hadPassword ? m_credentials->load(oldEndpoint) : QByteArray();
+    const QString oldKeyPassKey = oldEndpoint + QStringLiteral("#keypass");
+    const QString newKeyPassKey = newEndpoint + QStringLiteral("#keypass");
+    const bool hadKeyPass = m_credentials->contains(oldKeyPassKey);
+    const QByteArray oldKeyPass = hadKeyPass ? m_credentials->load(oldKeyPassKey) : QByteArray();
+
+    if (editingCurrentSession) {
+        teardownSession();
+        m_connectionState = RsSessionState_Idle;
+        emit connectionStateChanged();
+        if (!m_currentEndpoint.isEmpty()) {
+            m_currentEndpoint.clear();
+            emit currentEndpointChanged();
+        }
+    }
+
+    if (!m_servers->updateServer(index, name, cleanHost, p, cleanUser,
+                                 static_cast<int>(RsProviderKind_Russh), keyPath)) {
+        m_terminal->appendNotice(QStringLiteral("服务器配置更新失败。"));
+        return;
+    }
+    m_servers->setStatus(index, RsSessionState_Idle);
+
+    if (!password.isEmpty()) {
+        m_credentials->store(newEndpoint, password.toUtf8());
+        if (endpointChanged)
+            m_credentials->remove(oldEndpoint);
+    } else if (endpointChanged && hadPassword) {
+        m_credentials->store(newEndpoint, oldPassword);
+        m_credentials->remove(oldEndpoint);
+    }
+
+    if (!keyPassphrase.isEmpty()) {
+        m_credentials->store(newKeyPassKey, keyPassphrase.toUtf8());
+        if (endpointChanged)
+            m_credentials->remove(oldKeyPassKey);
+    } else if (endpointChanged && hadKeyPass) {
+        m_credentials->store(newKeyPassKey, oldKeyPass);
+        m_credentials->remove(oldKeyPassKey);
+    }
+
+    saveServers();
+    selectServer(index);
+    m_terminal->appendNotice(QStringLiteral("已更新服务器：%1").arg(newEndpoint));
 }
 
 void AppController::deleteServer(int index) {
@@ -334,6 +688,180 @@ void AppController::clearTerminal() {
     m_terminal->clear();
 }
 
+quint64 AppController::submitExec(const QString &command, quint64 timeoutMs, int kind,
+                                  const QString &label) {
+    if (!m_session || m_connectionState != RsSessionState_Connected)
+        return 0;
+    const quint64 id = m_bridge.exec(m_session, command, timeoutMs);
+    if (id == 0)
+        return 0;
+    m_execPending.insert(id, PendingExec{static_cast<PendingExec::Kind>(kind), label});
+    return id;
+}
+
+void AppController::refreshEnvironment() {
+    if (!m_session || m_connectionState != RsSessionState_Connected) {
+        m_packageStatusText = QStringLiteral("未连接，无法扫描环境");
+        emit packageStateChanged();
+        return;
+    }
+    if (m_packageBusy)
+        return;
+
+    m_packageBusy = true;
+    m_packageStatusText = QStringLiteral("正在扫描服务器环境...");
+    emit packageStateChanged();
+
+    const QString probe = QStringLiteral(
+        "printf '__RSSH_ENV_PROBE__\\n'; "
+        "if [ -r /etc/os-release ]; then . /etc/os-release; printf 'os=%s\\n' \"${PRETTY_NAME:-$NAME}\"; else uname -s | sed 's/^/os=/'; fi; "
+        "printf 'kernel=%s\\n' \"$(uname -r 2>/dev/null || true)\"; "
+        "printf 'arch=%s\\n' \"$(uname -m 2>/dev/null || true)\"; "
+        "for tool in apt dnf yum pacman zypper python3 python pip pip3 uv conda mamba npm module ml spack; do "
+        "p=$(command -v \"$tool\" 2>/dev/null || true); [ -n \"$p\" ] && printf 'tool:%s=%s\\n' \"$tool\" \"$p\"; "
+        "done; "
+        "(python3 --version 2>&1 || python --version 2>&1 || true) | head -n 1 | sed 's/^/version:python=/'; "
+        "(gcc --version 2>/dev/null || true) | head -n 1 | sed 's/^/version:gcc=/'; "
+        "(nvcc --version 2>/dev/null | grep release || true) | sed 's/^/version:cuda=/'; "
+        "printf '__RSSH_ENV_DONE__\\n'");
+    if (submitExec(probe, 8000, PendingExec::EnvironmentProbe, QStringLiteral("环境扫描")) == 0) {
+        m_packageBusy = false;
+        m_packageStatusText = QStringLiteral("环境扫描请求提交失败");
+        emit packageStateChanged();
+    }
+}
+
+void AppController::searchPackages(const QString &query) {
+    const QString q = query.trimmed();
+    if (q.isEmpty())
+        return;
+    if (!m_session || m_connectionState != RsSessionState_Connected) {
+        m_packageStatusText = QStringLiteral("未连接，无法搜索包");
+        emit packageStateChanged();
+        return;
+    }
+    if (m_packageBusy)
+        return;
+
+    m_packageBusy = true;
+    m_packageStatusText = QStringLiteral("正在搜索：%1").arg(q);
+    m_packageSearchResults.clear();
+    emit packageStateChanged();
+
+    const QString command = packageSearchCommand(q);
+    if (submitExec(command, 12000, PendingExec::PackageSearch, q) == 0) {
+        m_packageBusy = false;
+        m_packageStatusText = QStringLiteral("搜索请求提交失败");
+        emit packageStateChanged();
+    }
+}
+
+void AppController::installPackage(const QString &manager, const QString &name) {
+    const QString mgr = manager.trimmed().toLower();
+    const QString pkg = name.trimmed();
+    if (pkg.isEmpty())
+        return;
+    if (!m_session || m_connectionState != RsSessionState_Connected) {
+        m_packageStatusText = QStringLiteral("未连接，无法安装包");
+        emit packageStateChanged();
+        return;
+    }
+    if (m_packageBusy)
+        return;
+
+    if (!canInstallPackageManager(mgr)) {
+        m_packageStatusText = QStringLiteral("%1 来源暂不支持一键安装").arg(manager);
+        emit packageStateChanged();
+        return;
+    }
+    const QString command = packageMutationCommand(PackageAction::Install, mgr, pkg);
+    if (command.isEmpty()) {
+        m_packageStatusText = QStringLiteral("%1 来源暂不支持一键安装").arg(manager);
+        emit packageStateChanged();
+        return;
+    }
+
+    m_packageBusy = true;
+    m_packageLogText.clear();
+    m_packageStatusText = QStringLiteral("正在安装 %1（%2）...").arg(pkg, manager);
+    emit packageStateChanged();
+    if (submitExec(command, 300000, PendingExec::PackageInstall, pkg) == 0) {
+        m_packageBusy = false;
+        m_packageStatusText = QStringLiteral("安装请求提交失败");
+        emit packageStateChanged();
+    }
+}
+
+void AppController::updatePackage(const QString &manager, const QString &name) {
+    const QString mgr = manager.trimmed().toLower();
+    const QString pkg = name.trimmed();
+    if (pkg.isEmpty())
+        return;
+    if (!m_session || m_connectionState != RsSessionState_Connected) {
+        m_packageStatusText = QStringLiteral("未连接，无法更新包");
+        emit packageStateChanged();
+        return;
+    }
+    if (m_packageBusy)
+        return;
+    if (!canUpdatePackageManager(mgr)) {
+        m_packageStatusText = QStringLiteral("%1 来源暂不支持一键更新").arg(manager);
+        emit packageStateChanged();
+        return;
+    }
+    const QString command = packageMutationCommand(PackageAction::Update, mgr, pkg);
+    if (command.isEmpty()) {
+        m_packageStatusText = QStringLiteral("%1 来源暂不支持一键更新").arg(manager);
+        emit packageStateChanged();
+        return;
+    }
+
+    m_packageBusy = true;
+    m_packageLogText.clear();
+    m_packageStatusText = QStringLiteral("正在更新 %1（%2）...").arg(pkg, manager);
+    emit packageStateChanged();
+    if (submitExec(command, 300000, PendingExec::PackageUpdate, pkg) == 0) {
+        m_packageBusy = false;
+        m_packageStatusText = QStringLiteral("更新请求提交失败");
+        emit packageStateChanged();
+    }
+}
+
+void AppController::removePackage(const QString &manager, const QString &name) {
+    const QString mgr = manager.trimmed().toLower();
+    const QString pkg = name.trimmed();
+    if (pkg.isEmpty())
+        return;
+    if (!m_session || m_connectionState != RsSessionState_Connected) {
+        m_packageStatusText = QStringLiteral("未连接，无法卸载包");
+        emit packageStateChanged();
+        return;
+    }
+    if (m_packageBusy)
+        return;
+    if (!canRemovePackageManager(mgr)) {
+        m_packageStatusText = QStringLiteral("%1 来源暂不支持一键卸载").arg(manager);
+        emit packageStateChanged();
+        return;
+    }
+    const QString command = packageMutationCommand(PackageAction::Remove, mgr, pkg);
+    if (command.isEmpty()) {
+        m_packageStatusText = QStringLiteral("%1 来源暂不支持一键卸载").arg(manager);
+        emit packageStateChanged();
+        return;
+    }
+
+    m_packageBusy = true;
+    m_packageLogText.clear();
+    m_packageStatusText = QStringLiteral("正在卸载 %1（%2）...").arg(pkg, manager);
+    emit packageStateChanged();
+    if (submitExec(command, 300000, PendingExec::PackageRemove, pkg) == 0) {
+        m_packageBusy = false;
+        m_packageStatusText = QStringLiteral("卸载请求提交失败");
+        emit packageStateChanged();
+    }
+}
+
 void AppController::runPythonFile(const QString &path, const QString &device) {
     if (!m_session || m_connectionState != RsSessionState_Connected) {
         m_terminal->appendNotice(QStringLiteral("未连接,无法运行 Python 文件。"));
@@ -366,8 +894,12 @@ void AppController::runPythonFile(const QString &path, const QString &device) {
     }
 
     m_terminal->appendNotice(QStringLiteral("运行 %1，目标：%2").arg(path, label));
-    sendShellLine(QStringLiteral("%1python %2").arg(envPrefix, shellQuote(path)),
-                  QStringLiteral("运行 Python 失败"));
+    const QString command =
+        QStringLiteral("%1PYTHON_BIN=$(command -v python3 2>/dev/null || command -v python 2>/dev/null); "
+                       "if [ -z \"$PYTHON_BIN\" ]; then echo 'python3/python not found' >&2; exit 127; fi; "
+                       "\"$PYTHON_BIN\" %2")
+            .arg(envPrefix, shellQuote(path));
+    sendShellLine(command, QStringLiteral("运行 Python 失败"));
 }
 
 void AppController::refreshResourceSnapshot() {
@@ -401,7 +933,7 @@ void AppController::refreshResourceSnapshot() {
         "printf '__RSSH_RESOURCE_DISK__\\n'; "
         "df -hP 2>/dev/null | awk 'NR>1 {print $1 \"|\" $2 \"|\" $3 \"|\" $4 \"|\" $5 \"|\" $6}' | head -n 8 || true; "
         "printf '__RSSH_RESOURCE_END__\\n'");
-    if (!sendShellLine(command, QStringLiteral("资源快照命令发送失败"))) {
+    if (submitExec(command, 8000, PendingExec::ResourceSnapshot, QStringLiteral("资源快照")) == 0) {
         m_resourceSnapshotBusy = false;
         m_resourceCapture.clear();
         m_resourceMarkerTail.clear();
@@ -746,14 +1278,18 @@ void AppController::uploadFile(const QString &destDir, const QUrl &localFile) {
 }
 
 void AppController::saveEditor(const QString &text) {
+    saveEditorPath(m_editor->path(), text);
+}
+
+void AppController::saveEditorPath(const QString &path, const QString &text) {
     if (!m_session || m_connectionState != RsSessionState_Connected) {
         m_terminal->appendNotice(QStringLiteral("未连接,无法保存远端文件。"));
         return;
     }
-    if (!m_editor->isOpen() || m_editor->path().isEmpty())
+    if (path.isEmpty())
         return;
 
-    const QString path = m_editor->path();
+    m_editor->activatePath(path);
     m_editor->beginSave();
     const quint64 id = m_bridge.fsWrite(m_session, path, text.toUtf8());
     if (id == 0) {
@@ -779,6 +1315,14 @@ void AppController::setConnectionState(RsSessionState state) {
         m_resourceSnapshotBusy = false;
         m_resourceCapture.clear();
         m_resourceMarkerTail.clear();
+        m_execPending.clear();
+        m_packageTools.clear();
+        m_installedPackages.clear();
+        m_packageSearchResults.clear();
+        m_packageLogText.clear();
+        m_packageBusy = false;
+        m_packageStatusText = QStringLiteral("连接后可扫描环境");
+        emit packageStateChanged();
         emit resourceSnapshotChanged();
         setFileStatus(false, QStringLiteral("连接后显示远端文件"));
         m_fileTree->clearTree();
@@ -798,6 +1342,14 @@ void AppController::teardownSession() {
     m_resourceSnapshotBusy = false;
     m_resourceCapture.clear();
     m_resourceMarkerTail.clear();
+    m_execPending.clear();
+    m_packageTools.clear();
+    m_installedPackages.clear();
+    m_packageSearchResults.clear();
+    m_packageLogText.clear();
+    m_packageBusy = false;
+    m_packageStatusText = QStringLiteral("连接后可扫描环境");
+    emit packageStateChanged();
     emit resourceSnapshotChanged();
     setFileStatus(false, QStringLiteral("连接后显示远端文件"));
     emit clipboardChanged();
@@ -1171,23 +1723,297 @@ void AppController::parseResourceSnapshot(const QString &text) {
     }
 }
 
+void AppController::ingestExecResults(const ExecResultBatch &batch) {
+    for (const ExecResult &result : batch) {
+        const auto it = m_execPending.find(result.requestId);
+        if (it == m_execPending.end())
+            continue;
+
+        const PendingExec pending = it.value();
+        m_execPending.erase(it);
+
+        const bool isError = result.kind == static_cast<int>(RsExecResultKind_Error);
+        const QString stdoutText = QString::fromUtf8(result.stdoutData);
+        const QString stderrText =
+            result.message.isEmpty() ? QString::fromUtf8(result.stderrData) : result.message;
+
+        switch (pending.kind) {
+        case PendingExec::ResourceSnapshot:
+            m_resourceSnapshotBusy = false;
+            if (isError || result.exitStatus != 0) {
+                m_resourceSnapshotText = stderrText.isEmpty()
+                                             ? QStringLiteral("资源快照采集失败")
+                                             : QStringLiteral("资源快照采集失败：%1").arg(stderrText);
+                emit resourceSnapshotChanged();
+            } else {
+                parseResourceSnapshot(stdoutText);
+            }
+            break;
+        case PendingExec::EnvironmentProbe:
+            m_packageBusy = false;
+            if (isError || result.exitStatus != 0) {
+                m_packageStatusText = stderrText.isEmpty()
+                                          ? QStringLiteral("环境扫描失败")
+                                          : QStringLiteral("环境扫描失败：%1").arg(stderrText);
+            } else {
+                parseEnvironmentProbe(stdoutText);
+            }
+            emit packageStateChanged();
+            break;
+        case PendingExec::PackageList:
+            m_packageBusy = false;
+            if (isError || result.exitStatus != 0) {
+                m_packageStatusText = stderrText.isEmpty()
+                                          ? QStringLiteral("已安装清单读取失败")
+                                          : QStringLiteral("已安装清单读取失败：%1").arg(stderrText);
+            } else {
+                parseInstalledPackages(stdoutText);
+            }
+            emit packageStateChanged();
+            break;
+        case PendingExec::PackageSearch:
+            m_packageBusy = false;
+            if (isError || result.exitStatus != 0) {
+                m_packageStatusText = stderrText.isEmpty()
+                                          ? QStringLiteral("包搜索失败")
+                                          : QStringLiteral("包搜索失败：%1").arg(stderrText);
+            } else {
+                parsePackageSearch(stdoutText);
+            }
+            emit packageStateChanged();
+            break;
+        case PendingExec::PackageInstall:
+            m_packageBusy = false;
+            finishPackageMutation(result, QStringLiteral("安装完成"), QStringLiteral("安装失败"),
+                                  QStringLiteral("安装后刷新包列表"));
+            emit packageStateChanged();
+            break;
+        case PendingExec::PackageUpdate:
+            m_packageBusy = false;
+            finishPackageMutation(result, QStringLiteral("更新完成"), QStringLiteral("更新失败"),
+                                  QStringLiteral("更新后刷新包列表"));
+            emit packageStateChanged();
+            break;
+        case PendingExec::PackageRemove:
+            m_packageBusy = false;
+            finishPackageMutation(result, QStringLiteral("卸载完成"), QStringLiteral("卸载失败"),
+                                  QStringLiteral("卸载后刷新包列表"));
+            emit packageStateChanged();
+            break;
+        }
+    }
+}
+
+void AppController::parseEnvironmentProbe(const QString &text) {
+    QVariantList tools;
+    QString osText;
+    QString pythonText;
+    QString cudaText;
+
+    const QStringList lines = text.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
+                                         Qt::SkipEmptyParts);
+    for (const QString &raw : lines) {
+        const QString line = raw.trimmed();
+        if (line.startsWith(QStringLiteral("os="))) {
+            osText = line.mid(3);
+        } else if (line.startsWith(QStringLiteral("version:python="))) {
+            pythonText = line.mid(QStringLiteral("version:python=").size());
+        } else if (line.startsWith(QStringLiteral("version:cuda="))) {
+            cudaText = line.mid(QStringLiteral("version:cuda=").size());
+        } else if (line.startsWith(QStringLiteral("tool:"))) {
+            const int eq = line.indexOf('=');
+            if (eq <= 5)
+                continue;
+            QVariantMap tool;
+            tool.insert(QStringLiteral("name"), line.mid(5, eq - 5));
+            tool.insert(QStringLiteral("path"), line.mid(eq + 1));
+            tools.push_back(tool);
+        }
+    }
+
+    m_packageTools = tools;
+    QStringList summary;
+    if (!osText.isEmpty())
+        summary.push_back(osText);
+    if (!pythonText.isEmpty())
+        summary.push_back(pythonText);
+    if (!cudaText.isEmpty())
+        summary.push_back(QStringLiteral("CUDA: %1").arg(cudaText));
+    m_packageStatusText =
+        summary.isEmpty() ? QStringLiteral("环境扫描完成") : summary.join(QStringLiteral(" · "));
+
+    const QString listCommand = packageListCommand();
+    m_packageBusy = true;
+    if (submitExec(listCommand, 12000, PendingExec::PackageList, QStringLiteral("已安装包列表")) ==
+        0) {
+        m_packageBusy = false;
+        m_packageStatusText = QStringLiteral("环境扫描完成，但已安装清单请求提交失败");
+    }
+}
+
+void AppController::parseInstalledPackages(const QString &text) {
+    QVariantList packages;
+    const QStringList lines = text.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
+                                         Qt::SkipEmptyParts);
+    for (const QString &raw : lines) {
+        const QString line = raw.trimmed();
+        if (line.startsWith(QStringLiteral("__RSSH_")))
+            continue;
+        const QStringList parts = line.split('|');
+        if (parts.size() < 3)
+            continue;
+        QVariantMap pkg;
+        const QString manager = parts.at(0).trimmed();
+        const QString name = parts.at(1).trimmed();
+        pkg.insert(QStringLiteral("manager"), manager);
+        pkg.insert(QStringLiteral("name"), name);
+        pkg.insert(QStringLiteral("version"), parts.at(2).trimmed());
+        const QString normalizedManager = manager.toLower();
+        pkg.insert(QStringLiteral("canUpdate"), canUpdatePackageManager(normalizedManager));
+        pkg.insert(QStringLiteral("canRemove"), canRemovePackageManager(normalizedManager));
+        packages.push_back(pkg);
+    }
+    m_installedPackages = packages;
+    m_packageStatusText = QStringLiteral("已安装包：%1 项").arg(packages.size());
+}
+
+void AppController::parsePackageSearch(const QString &text) {
+    QVariantList results;
+    const QStringList lines = text.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
+                                         Qt::SkipEmptyParts);
+    for (const QString &raw : lines) {
+        const QString line = raw.trimmed();
+        if (line.startsWith(QStringLiteral("__RSSH_")))
+            continue;
+        QVariantMap item;
+        const QStringList parts = line.split('|');
+        if (parts.size() >= 4) {
+            const QString manager = parts.at(0).trimmed();
+            const QString name = parts.at(1).trimmed();
+            item.insert(QStringLiteral("manager"), manager);
+            item.insert(QStringLiteral("name"), name);
+            item.insert(QStringLiteral("version"), parts.at(2).trimmed());
+            item.insert(QStringLiteral("detail"), parts.mid(3).join(QStringLiteral(" | ")).trimmed());
+            const QString normalizedManager = manager.toLower();
+            item.insert(QStringLiteral("canInstall"), canInstallPackageManager(normalizedManager));
+            item.insert(QStringLiteral("installed"),
+                        packageAlreadyInstalled(m_installedPackages, normalizedManager, name));
+        } else if (parts.size() >= 2) {
+            const QString manager = parts.at(0).trimmed();
+            const QString name = parts.at(1).trimmed();
+            item.insert(QStringLiteral("manager"), manager);
+            item.insert(QStringLiteral("name"), name);
+            item.insert(QStringLiteral("version"), QStringLiteral("latest"));
+            item.insert(QStringLiteral("detail"), line);
+            const QString normalizedManager = manager.toLower();
+            item.insert(QStringLiteral("canInstall"), canInstallPackageManager(normalizedManager));
+            item.insert(QStringLiteral("installed"),
+                        packageAlreadyInstalled(m_installedPackages, normalizedManager, name));
+        } else {
+            continue;
+        }
+        results.push_back(item);
+    }
+    m_packageSearchResults = results;
+    m_packageStatusText = QStringLiteral("搜索结果：%1 项").arg(results.size());
+}
+
+void AppController::finishUpdateCheck(const QByteArray &payload, const QString &networkError) {
+    m_updateBusy = false;
+    m_updateAvailable = false;
+    m_updateDownloadUrl.clear();
+
+    if (!networkError.isEmpty()) {
+        m_updateStatusText = QStringLiteral("热更新检查失败：%1").arg(networkError);
+        emit updateStateChanged();
+        return;
+    }
+
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(payload, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        m_updateStatusText = QStringLiteral("热更新检查失败：响应格式无效");
+        emit updateStateChanged();
+        return;
+    }
+
+    const QJsonObject release = document.object();
+    const QString tag = release.value(QStringLiteral("tag_name")).toString();
+    const QString latestText = versionWithoutPrefix(tag);
+    const QVersionNumber currentVersion = QVersionNumber::fromString(appVersion());
+    const QVersionNumber latestVersion = QVersionNumber::fromString(latestText);
+    const QString htmlUrl = release.value(QStringLiteral("html_url")).toString();
+    const QString downloadUrl =
+        preferredReleaseDownloadUrl(release.value(QStringLiteral("assets")).toArray(), htmlUrl);
+
+    if (tag.isEmpty() || latestVersion.isNull()) {
+        m_updateStatusText = QStringLiteral("热更新检查失败：未识别最新版本");
+        m_updateDownloadUrl = htmlUrl;
+        emit updateStateChanged();
+        return;
+    }
+
+    if (!currentVersion.isNull() && QVersionNumber::compare(latestVersion, currentVersion) > 0) {
+        m_updateAvailable = true;
+        m_updateDownloadUrl = downloadUrl;
+        m_updateStatusText = QStringLiteral("发现新版本 %1").arg(tag);
+    } else {
+        m_updateDownloadUrl = htmlUrl;
+        m_updateStatusText = QStringLiteral("当前已是最新版本（%1）").arg(appVersion());
+    }
+
+    emit updateStateChanged();
+}
+
+void AppController::finishPackageMutation(const ExecResult &result, const QString &successText,
+                                          const QString &failureText,
+                                          const QString &refreshText) {
+    const bool isError = result.kind == static_cast<int>(RsExecResultKind_Error);
+    const QString output = QString::fromUtf8(result.stdoutData + result.stderrData).trimmed();
+    m_packageLogText = tailForUi(output);
+    if (isError || result.exitStatus != 0) {
+        const QString detail =
+            result.message.isEmpty() ? tailForUi(output, 700) : result.message.trimmed();
+        m_packageStatusText = detail.isEmpty()
+                                  ? failureText
+                                  : QStringLiteral("%1，详情见操作日志").arg(failureText);
+        if (m_packageLogText.isEmpty())
+            m_packageLogText = detail;
+        return;
+    }
+    m_packageStatusText = successText;
+    const QString listCommand = packageListCommand();
+    m_packageBusy = true;
+    if (submitExec(listCommand, 12000, PendingExec::PackageList, refreshText) == 0) {
+        m_packageBusy = false;
+        m_packageStatusText = QStringLiteral("%1，但刷新包列表失败").arg(successText);
+    }
+}
+
 bool AppController::captureResourceOutput(const QByteArray &data) {
     if (!m_resourceSnapshotBusy)
         return false;
 
     const QString chunk = QString::fromUtf8(data);
-    QString captureChunk = chunk;
-    if (!containsMarkerLine(m_resourceCapture, kResourceBegin)) {
+    const QString beginMarker = QString::fromLatin1(kResourceBegin);
+    const QString endMarker = QString::fromLatin1(kResourceEnd);
+
+    if (m_resourceCapture.isEmpty()) {
         const QString probe = m_resourceMarkerTail + chunk;
-        if (!containsMarkerLine(probe, kResourceBegin)) {
-            m_resourceMarkerTail = probe.right(QString::fromLatin1(kResourceBegin).size() + 2);
-            return true;
+        const qsizetype begin = probe.indexOf(beginMarker);
+        if (begin < 0) {
+            m_resourceMarkerTail = probe.right(beginMarker.size() - 1);
+            return false;
         }
-        captureChunk = probe;
+        const qsizetype chunkStart = qMax<qsizetype>(0, begin - m_resourceMarkerTail.size());
+        if (chunkStart > 0)
+            m_terminal->appendBytes(data.left(static_cast<qsizetype>(chunkStart)));
+        m_resourceCapture = probe.mid(begin);
         m_resourceMarkerTail.clear();
+    } else {
+        m_resourceCapture.append(chunk);
     }
 
-    m_resourceCapture.append(captureChunk);
     if (m_resourceCapture.size() > 50000) {
         m_resourceSnapshotBusy = false;
         m_resourceSnapshotText = QStringLiteral("资源快照过长，已停止解析");
@@ -1196,11 +2022,16 @@ bool AppController::captureResourceOutput(const QByteArray &data) {
         emit resourceSnapshotChanged();
         return true;
     }
-    if (extractMarkedBody(m_resourceCapture, nullptr)) {
-        const QString captured = m_resourceCapture;
+    const qsizetype end = m_resourceCapture.indexOf(endMarker);
+    if (end >= 0) {
+        const qsizetype capturedEnd = end + endMarker.size();
+        const QString captured = m_resourceCapture.left(capturedEnd);
+        const QString trailing = m_resourceCapture.mid(capturedEnd);
         m_resourceCapture.clear();
         m_resourceMarkerTail.clear();
         parseResourceSnapshot(captured);
+        if (!trailing.isEmpty())
+            m_terminal->appendBytes(trailing.toUtf8());
     }
     return true;
 }

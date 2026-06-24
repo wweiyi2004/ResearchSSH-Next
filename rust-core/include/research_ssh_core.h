@@ -53,6 +53,14 @@ typedef enum {
     RsEventKind_HostKeyPrompt = 3,
 } RsEventKind;
 
+// Discriminator for [`RsExecResult`].
+typedef enum {
+    // stdout/stderr/exit_status are valid.
+    RsExecResultKind_Output = 0,
+    // error_code/message are valid.
+    RsExecResultKind_Error = 1,
+} RsExecResultKind;
+
 // Kind of a remote directory entry.
 typedef enum {
     // Regular file.
@@ -181,6 +189,28 @@ typedef struct {
     const char *message;
 } RsFsResult;
 
+// Result of one side-channel command, correlated by `request_id`.
+typedef struct {
+    // Matches the id returned by `rscore_session_exec`.
+    uint64_t request_id;
+    // Which fields are valid.
+    RsExecResultKind kind;
+    // Captured stdout bytes.
+    const uint8_t *stdout_data;
+    // Length of stdout.
+    uintptr_t stdout_len;
+    // Captured stderr bytes.
+    const uint8_t *stderr_data;
+    // Length of stderr.
+    uintptr_t stderr_len;
+    // Process exit status, or -1 if unavailable.
+    int32_t exit_status;
+    // Error code (valid when `kind == Error`).
+    RsErrorCode error_code;
+    // UTF-8 error message (valid when `kind == Error`).
+    const char *message;
+} RsExecResult;
+
 // Event callback. Receives a batch of `count` events. See the module-level
 // ownership contract for pointer lifetimes and threading rules.
 typedef void (*RsEventCallback)(void *user_data, const RsEvent *events, uintptr_t count);
@@ -265,6 +295,16 @@ RsErrorCode rscore_session_set_file_callback(RsSession *session,
                                                         const RsFsResult *results,
                                                         uintptr_t count),
                                              void *user_data);
+
+// Registers the side-channel command callback for a session.
+RsErrorCode rscore_session_set_exec_callback(RsSession *session,
+                                             void (*cb)(void *user_data,
+                                                        const RsExecResult *results,
+                                                        uintptr_t count),
+                                             void *user_data);
+
+// Runs a non-interactive command on a side channel. Returns a request id.
+uint64_t rscore_session_exec(RsSession *session, const char *command, uint64_t timeout_ms);
 
 // Lists a directory (empty `path` = the connection's home dir). Returns a request id.
 uint64_t rscore_session_fs_list(RsSession *session, const char *path);

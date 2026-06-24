@@ -10,16 +10,20 @@ use crate::fs::{looks_like_text, FileEntry, FileKind, FileProvider};
 use crate::provider::{ConnectionConfig, ProviderEvent, ProviderSink, SshProvider};
 use crate::secret::Secret;
 use crate::session::HostKeyGate;
+use crate::task::ExecOutput;
 use crate::{CoreError, CoreResult, RsErrorCode};
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 use russh::client::{self, Handle};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
+use russh::ChannelMsg;
 use russh::Disconnect;
 use russh_sftp::client::SftpSession;
 
@@ -225,7 +229,14 @@ impl SshProvider for RusshProvider {
         let candidates: Vec<PathBuf> = match &self.key_path {
             Some(p) => vec![PathBuf::from(p)],
             None => default_ssh_dir()
-                .map(|d| keys_in_dir(&d))
+                .map(|d| {
+                    keys_in_dir(
+                        &d,
+                        &self.config.host,
+                        &self.config.username,
+                        self.config.port,
+                    )
+                })
                 .unwrap_or_default(),
         };
         let passphrase: Option<Zeroizing<String>> = match &self.key_passphrase {
@@ -304,7 +315,7 @@ impl SshProvider for RusshProvider {
             .await
             .map_err(|e| connect_err("open channel", e))?;
         channel
-            .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
+            .request_pty(false, "xterm-256color", 160, 40, 0, 0, &[])
             .await
             .map_err(|e| connect_err("request pty", e))?;
         channel
@@ -370,6 +381,22 @@ impl SshProvider for RusshProvider {
         Ok(())
     }
 
+    async fn exec(&mut self, command: &str, timeout_ms: u64) -> CoreResult<ExecOutput> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| CoreError::new(RsErrorCode::NotConnected))?;
+        let timeout = Duration::from_millis(timeout_ms.max(1));
+        tokio::time::timeout(timeout, run_russh_exec(session, command))
+            .await
+            .map_err(|_| {
+                CoreError::with_detail(
+                    RsErrorCode::Cancelled,
+                    format!("command timed out after {timeout_ms} ms"),
+                )
+            })?
+    }
+
     async fn disconnect(&mut self) -> CoreResult<()> {
         if let Some(mut writer) = self.writer.take() {
             let _ = writer.shutdown().await;
@@ -384,6 +411,60 @@ impl SshProvider for RusshProvider {
         }
         Ok(())
     }
+}
+
+async fn run_russh_exec(
+    session: &mut Handle<ClientHandler>,
+    command: &str,
+) -> CoreResult<ExecOutput> {
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| connect_err("exec open channel", e))?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|e| connect_err("exec request", e))?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_status = -1;
+    loop {
+        let Some(msg) = channel.wait().await else {
+            break;
+        };
+        match msg {
+            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, ext } => {
+                if ext == 1 {
+                    stderr.extend_from_slice(&data);
+                }
+            }
+            ChannelMsg::ExitStatus { exit_status: code } => {
+                exit_status = code as i32;
+            }
+            ChannelMsg::ExitSignal {
+                signal_name,
+                error_message,
+                ..
+            } => {
+                if !error_message.is_empty() {
+                    stderr.extend_from_slice(error_message.as_bytes());
+                } else {
+                    stderr.extend_from_slice(format!("terminated by {signal_name:?}").as_bytes());
+                }
+                exit_status = -1;
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    Ok(ExecOutput {
+        stdout,
+        stderr,
+        exit_status,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -473,14 +554,122 @@ fn default_ssh_dir() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".ssh"))
 }
 
-/// Default OpenSSH identity files in `ssh_dir` that actually exist, in OpenSSH
-/// preference order (modern algorithms first).
-fn keys_in_dir(ssh_dir: &Path) -> Vec<PathBuf> {
-    ["id_ed25519", "id_ecdsa", "id_rsa"]
-        .iter()
-        .map(|name| ssh_dir.join(name))
-        .filter(|p| p.is_file())
-        .collect()
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    fn inner(pattern: &[u8], text: &[u8]) -> bool {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+        match pattern[0] {
+            b'*' => inner(&pattern[1..], text) || (!text.is_empty() && inner(pattern, &text[1..])),
+            b'?' => !text.is_empty() && inner(&pattern[1..], &text[1..]),
+            c => {
+                !text.is_empty()
+                    && c.eq_ignore_ascii_case(&text[0])
+                    && inner(&pattern[1..], &text[1..])
+            }
+        }
+    }
+    inner(pattern.as_bytes(), host.as_bytes())
+}
+
+fn host_clause_matches(patterns: &str, host: &str) -> bool {
+    let mut positive = false;
+    for pattern in patterns.split_whitespace() {
+        if let Some(negated) = pattern.strip_prefix('!') {
+            if host_pattern_matches(negated, host) {
+                return false;
+            }
+        } else if host_pattern_matches(pattern, host) {
+            positive = true;
+        }
+    }
+    positive
+}
+
+fn expand_identity_file(
+    raw: &str,
+    ssh_dir: &Path,
+    host: &str,
+    username: &str,
+    port: u16,
+) -> PathBuf {
+    let mut value = raw.trim_matches('"').to_string();
+    if let Some(home) = home_dir() {
+        if value == "~" {
+            value = home.to_string_lossy().into_owned();
+        } else if let Some(rest) = value.strip_prefix("~/") {
+            value = home.join(rest).to_string_lossy().into_owned();
+        }
+    }
+    value = value
+        .replace("%h", host)
+        .replace("%n", host)
+        .replace("%r", username)
+        .replace("%p", &port.to_string());
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        ssh_dir.join(path)
+    }
+}
+
+fn identity_files_from_ssh_config(
+    ssh_dir: &Path,
+    host: &str,
+    username: &str,
+    port: u16,
+) -> Vec<PathBuf> {
+    let config_path = ssh_dir.join("config");
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+
+    let mut active = false;
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let key = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let value = parts.next().unwrap_or_default().trim();
+        if key == "host" {
+            active = host_clause_matches(value, host);
+            continue;
+        }
+        if active && key == "identityfile" && !value.is_empty() {
+            out.push(expand_identity_file(value, ssh_dir, host, username, port));
+        }
+    }
+    out
+}
+
+/// Candidate OpenSSH identity files, first from matching `~/.ssh/config`
+/// `IdentityFile` directives and then the normal default names.
+fn keys_in_dir(ssh_dir: &Path, host: &str, username: &str, port: u16) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in identity_files_from_ssh_config(ssh_dir, host, username, port)
+        .into_iter()
+        .chain(
+            ["id_ed25519", "id_ecdsa", "id_rsa"]
+                .iter()
+                .map(|name| ssh_dir.join(name)),
+        )
+    {
+        if path.is_file() && seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// Classify an SFTP entry, distinguishing symlinks from real directories/files.
@@ -575,10 +764,12 @@ impl FileProvider for SftpFileProvider {
 
     async fn write_file(&mut self, path: &str, data: &[u8]) -> CoreResult<()> {
         let p = self.resolve_path(path).await;
-        self.sftp
-            .write(p, data)
+        let mut file = self
+            .sftp
+            .create(p)
             .await
-            .map_err(|e| sftp_err("write", e))
+            .map_err(|e| sftp_err("create", e))?;
+        file.write_all(data).await.map_err(|e| sftp_err("write", e))
     }
 
     async fn rename(&mut self, from: &str, to: &str) -> CoreResult<()> {
@@ -646,8 +837,12 @@ impl FileProvider for SftpFileProvider {
             .read(from)
             .await
             .map_err(|e| sftp_err("copy read", e))?;
-        self.sftp
-            .write(to, &data)
+        let mut out = self
+            .sftp
+            .create(to)
+            .await
+            .map_err(|e| sftp_err("copy create", e))?;
+        out.write_all(&data)
             .await
             .map_err(|e| sftp_err("copy write", e))
     }
@@ -665,7 +860,7 @@ mod discovery_tests {
         std::fs::write(dir.join("id_rsa"), b"x").unwrap();
         std::fs::write(dir.join("id_ed25519"), b"x").unwrap();
 
-        let found = keys_in_dir(&dir);
+        let found = keys_in_dir(&dir, "gpu.cluster.edu", "researcher", 22);
         let names: Vec<String> = found
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
