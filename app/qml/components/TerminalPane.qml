@@ -80,8 +80,12 @@ Rectangle {
     }
 
     function outputAtBottom() {
-        return outputScrollBar.size >= 0.99
-               || outputScrollBar.position + outputScrollBar.size >= 0.98
+        return outputFlick.contentHeight <= outputFlick.height + 2
+               || outputFlick.contentY >= outputFlick.contentHeight - outputFlick.height - 2
+    }
+
+    function scrollOutputToBottom() {
+        outputFlick.contentY = Math.max(0, outputFlick.contentHeight - outputFlick.height)
     }
 
     function rememberCommand(command) {
@@ -134,57 +138,75 @@ Rectangle {
             Layout.preferredHeight: root.showHeader ? 42 : 0
         }
 
-        ScrollView {
-            id: scroll
+        Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
+            color: Theme.terminal
             clip: true
-            rightPadding: 12
-            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-            ScrollBar.vertical: ScrollBar {
-                id: outputScrollBar
-                policy: ScrollBar.AlwaysOn
-                interactive: true
-                minimumSize: 0.08
-                width: 12
-                onPositionChanged: root.followOutput = root.outputAtBottom()
-                onSizeChanged: root.followOutput = root.outputAtBottom()
 
-                background: Rectangle {
-                    implicitWidth: 12
-                    color: Theme.terminal
-                    Rectangle {
-                        anchors.centerIn: parent
-                        width: 1
-                        height: parent.height
-                        color: Theme.border
+            Flickable {
+                id: outputFlick
+                anchors.fill: parent
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                contentWidth: width
+                contentHeight: Math.max(height, outputText.y * 2 + outputText.height)
+                ScrollBar.vertical: ScrollBar {
+                    id: outputScrollBar
+                    policy: ScrollBar.AlwaysOn
+                    interactive: true
+                    minimumSize: 0.08
+                    width: 12
+                    onPressedChanged: {
+                        if (pressed)
+                            root.followOutput = false
+                    }
+
+                    background: Rectangle {
+                        implicitWidth: 12
+                        color: Theme.terminal
+                        Rectangle {
+                            anchors.centerIn: parent
+                            width: 1
+                            height: parent.height
+                            color: Theme.border
+                        }
+                    }
+
+                    contentItem: Rectangle {
+                        implicitWidth: 8
+                        radius: 4
+                        color: outputScrollBar.pressed || outputScrollBar.hovered
+                               ? Theme.accent
+                               : Theme.muted
+                        opacity: outputFlick.contentHeight > outputFlick.height + 2 ? 0.9 : 0.25
                     }
                 }
-
-                contentItem: Rectangle {
-                    implicitWidth: 8
-                    radius: 4
-                    color: outputScrollBar.pressed || outputScrollBar.hovered
-                           ? Theme.accent
-                           : Theme.muted
-                    opacity: outputScrollBar.size < 0.99 ? 0.85 : 0.25
+                onContentYChanged: {
+                    if (moving || flicking || dragging)
+                        root.followOutput = root.outputAtBottom()
                 }
-            }
 
-            TextArea {
-                id: output
-                readOnly: true
-                selectByMouse: true
-                wrapMode: TextArea.WrapAtWordBoundaryOrAnywhere
-                text: root.controller.terminal.text
-                color: Theme.textSoft
-                font.pixelSize: 15
-                font.family: "Cascadia Mono"
-                background: Rectangle { color: Theme.terminal }
-                padding: 14
-                onTextChanged: {
-                    if (root.followOutput)
-                        output.cursorPosition = output.length
+                TextEdit {
+                    id: outputText
+                    x: 14
+                    y: 14
+                    width: Math.max(1, outputFlick.width - 40)
+                    height: Math.max(contentHeight, outputFlick.height - 28)
+                    readOnly: true
+                    selectByMouse: true
+                    textFormat: TextEdit.PlainText
+                    wrapMode: TextEdit.WrapAtWordBoundaryOrAnywhere
+                    text: root.controller.terminal.text
+                    color: Theme.textSoft
+                    selectedTextColor: Theme.window
+                    selectionColor: Theme.accent
+                    font.pixelSize: 15
+                    font.family: "Cascadia Mono"
+                    onTextChanged: {
+                        if (root.followOutput)
+                            Qt.callLater(root.scrollOutputToBottom)
+                    }
                 }
             }
         }
@@ -227,7 +249,8 @@ Rectangle {
                     }
                     onTextEdited: {
                         root.historyIndex = root.commandHistory.length
-                        root.updateCompletion(false)
+                        if (terminalCompletion.opened)
+                            root.updateCompletion(false)
                     }
                     onCursorPositionChanged: {
                         if (terminalCompletion.opened)
@@ -239,8 +262,11 @@ Rectangle {
                                 && (event.modifiers & Qt.ControlModifier)) {
                             root.updateCompletion(true)
                             event.accepted = true
-                        } else if (event.key === Qt.Key_Tab && terminalCompletion.opened) {
-                            root.acceptCompletion(terminalCompletionList.currentIndex)
+                        } else if (event.key === Qt.Key_Tab) {
+                            if (terminalCompletion.opened)
+                                root.acceptCompletion(terminalCompletionList.currentIndex)
+                            else
+                                root.updateCompletion(true)
                             event.accepted = true
                         } else if (event.key === Qt.Key_Up) {
                             if (terminalCompletion.opened) {
