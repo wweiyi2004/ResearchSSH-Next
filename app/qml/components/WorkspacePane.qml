@@ -118,10 +118,4 @@ Rectangle {
         }
     }
 
-    Connections {
-        target: root.controller.editor
-        function onContentLoaded(path, text) {
-            workspaceTabs.currentIndex = 1
-        }
-    }
 }

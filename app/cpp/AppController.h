@@ -106,6 +106,7 @@ public slots:
     void connectToHost(const QString &host, int port, const QString &username,
                        const QString &password, const QString &name,
                        const QString &keyPath, const QString &keyPassphrase);
+    void deleteServer(int index);
     void disconnectCurrent();
     void cancel();
     // Deliver the user's host-key confirmation decision.
@@ -146,6 +147,8 @@ signals:
 private:
     void setConnectionState(RsSessionState state);
     void teardownSession();
+    void loadServers();
+    void saveServers() const;
     QString endpointFor(int index) const;
     void expandDir(const QString &path); // RemoteFileTreeModel::directoryExpandRequested
     static QString parentDirOf(const QString &path);
@@ -154,7 +157,9 @@ private:
     void setFileStatus(bool available, const QString &text);
     void seedResourceSnapshot(const QString &statusText);
     void parseResourceSnapshot(const QString &text);
-    void captureResourceOutput(const QByteArray &data);
+    bool sendTerminalBytes(const QByteArray &payload, const QString &failureContext);
+    bool sendShellLine(const QString &line, const QString &failureContext);
+    bool captureResourceOutput(const QByteArray &data);
     void rebuildResourceProcessGroups();
 
     // Tracks outstanding file requests so results can be dispatched by id.
@@ -164,6 +169,10 @@ private:
         QString refreshDir;      // for Mutate: directory to re-list on success
         QString extraRefreshDir; // optional second directory for moves
         bool clearClipboard = false;
+        enum Mutation { NoMutation, CreateLike, CopyLike, MoveLike, DeleteLike } mutation =
+            NoMutation;
+        QString destinationPath;
+        bool recursive = false;
     };
     void trackFsRequest(quint64 requestId, const PendingFs &pending);
     void clearPendingFs();

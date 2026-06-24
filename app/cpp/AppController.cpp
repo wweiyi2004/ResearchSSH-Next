@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSettings>
 #include <QStringDecoder>
 #include <QVariantMap>
 
@@ -134,15 +135,16 @@ AppController::~AppController() {
 bool AppController::initialize(QString *errorOut) {
     if (!m_bridge.initialize(errorOut))
         return false;
-    m_servers->seedDemoServers();
+    loadServers();
     if (m_servers->count() > 0)
         selectServer(0);
     m_terminal->appendNotice(
         QStringLiteral("ResearchSSH-Next 核心 %1 就绪(凭据后端：%2)。")
             .arg(RustCoreBridge::version(), credentialBackend()));
-    m_terminal->appendNotice(QStringLiteral(
-        "请选择左侧服务器并点击“连接”。当前为模拟 Provider；主机名以 “fail” 开头的条目"
-        "用于演示连接失败的错误流程。"));
+    m_terminal->appendNotice(
+        m_servers->count() > 0
+            ? QStringLiteral("已加载 %1 个 SSH 服务器。").arg(m_servers->count())
+            : QStringLiteral("点击左侧“添加服务器”添加 SSH 服务器。"));
     return true;
 }
 
@@ -222,7 +224,47 @@ void AppController::connectToHost(const QString &host, int port, const QString &
     if (!keyPassphrase.isEmpty())
         m_credentials->store(endpoint + QStringLiteral("#keypass"), keyPassphrase.toUtf8());
 
+    saveServers();
     connectToServer(index);
+}
+
+void AppController::deleteServer(int index) {
+    if (!m_servers->isValidIndex(index))
+        return;
+
+    const QString endpoint = endpointFor(index);
+    const bool deletingCurrentSession = index == m_currentIndex;
+
+    if (deletingCurrentSession) {
+        teardownSession();
+        m_connectionState = RsSessionState_Idle;
+        emit connectionStateChanged();
+        if (!m_currentEndpoint.isEmpty()) {
+            m_currentEndpoint.clear();
+            emit currentEndpointChanged();
+        }
+    } else if (m_currentIndex > index) {
+        --m_currentIndex;
+    }
+
+    m_credentials->remove(endpoint);
+    m_credentials->remove(endpoint + QStringLiteral("#keypass"));
+
+    if (!m_servers->removeServer(index))
+        return;
+    saveServers();
+
+    int nextSelected = m_selectedIndex;
+    if (m_selectedIndex == index)
+        nextSelected = m_servers->count() == 0 ? -1 : qMin(index, m_servers->count() - 1);
+    else if (m_selectedIndex > index)
+        --nextSelected;
+    if (nextSelected != m_selectedIndex || m_selectedIndex == index) {
+        m_selectedIndex = nextSelected;
+        emit selectedIndexChanged();
+    }
+
+    m_terminal->appendNotice(QStringLiteral("已删除服务器：%1").arg(endpoint));
 }
 
 void AppController::confirmHostKey(bool accept) {
@@ -247,17 +289,31 @@ void AppController::cancel() {
         m_bridge.cancelSession(m_session);
 }
 
+bool AppController::sendTerminalBytes(const QByteArray &payload,
+                                      const QString &failureContext) {
+    const RsErrorCode rc = m_bridge.sendToSession(m_session, payload);
+    if (rc != RsErrorCode_Ok) {
+        m_terminal->appendNotice(
+            QStringLiteral("%1：%2").arg(failureContext, RustCoreBridge::describe(rc)));
+        return false;
+    }
+    return true;
+}
+
+bool AppController::sendShellLine(const QString &line, const QString &failureContext) {
+    QByteArray payload = line.toUtf8();
+    payload.append('\r');
+    return sendTerminalBytes(payload, failureContext);
+}
+
 void AppController::sendCommand(const QString &text) {
     if (!m_session || m_connectionState != RsSessionState_Connected) {
         m_terminal->appendNotice(QStringLiteral("未连接,无法发送命令。"));
         return;
     }
-    QByteArray payload = text.toUtf8();
-    payload.append('\n');
-    const RsErrorCode rc = m_bridge.sendToSession(m_session, payload);
-    if (rc != RsErrorCode_Ok)
-        m_terminal->appendNotice(
-            QStringLiteral("发送失败：%1").arg(RustCoreBridge::describe(rc)));
+    if (text.trimmed().isEmpty())
+        return;
+    sendShellLine(text, QStringLiteral("发送失败"));
 }
 
 void AppController::sendInterrupt() {
@@ -266,11 +322,7 @@ void AppController::sendInterrupt() {
         return;
     }
     const QByteArray payload(1, '\x03');
-    const RsErrorCode rc = m_bridge.sendToSession(m_session, payload);
-    if (rc != RsErrorCode_Ok)
-        m_terminal->appendNotice(
-            QStringLiteral("中止信号发送失败：%1").arg(RustCoreBridge::describe(rc)));
-    else
+    if (sendTerminalBytes(payload, QStringLiteral("中止信号发送失败")))
         m_terminal->appendNotice(QStringLiteral("已发送 Ctrl+C。"));
 }
 
@@ -304,12 +356,18 @@ void AppController::runPythonFile(const QString &path, const QString &device) {
             gpu = gpu.mid(3).trimmed();
         if (gpu.isEmpty())
             gpu = QStringLiteral("0");
+        const QRegularExpression gpuIndexPattern(QStringLiteral("^\\d+$"));
+        if (!gpuIndexPattern.match(gpu).hasMatch()) {
+            m_terminal->appendNotice(QStringLiteral("GPU 编号无效：%1").arg(device));
+            return;
+        }
         envPrefix = QStringLiteral("CUDA_VISIBLE_DEVICES=%1 ").arg(gpu);
         label = QStringLiteral("GPU %1").arg(gpu);
     }
 
     m_terminal->appendNotice(QStringLiteral("运行 %1，目标：%2").arg(path, label));
-    sendCommand(QStringLiteral("%1python %2").arg(envPrefix, shellQuote(path)));
+    sendShellLine(QStringLiteral("%1python %2").arg(envPrefix, shellQuote(path)),
+                  QStringLiteral("运行 Python 失败"));
 }
 
 void AppController::refreshResourceSnapshot() {
@@ -343,7 +401,13 @@ void AppController::refreshResourceSnapshot() {
         "printf '__RSSH_RESOURCE_DISK__\\n'; "
         "df -hP 2>/dev/null | awk 'NR>1 {print $1 \"|\" $2 \"|\" $3 \"|\" $4 \"|\" $5 \"|\" $6}' | head -n 8 || true; "
         "printf '__RSSH_RESOURCE_END__\\n'");
-    sendCommand(command);
+    if (!sendShellLine(command, QStringLiteral("资源快照命令发送失败"))) {
+        m_resourceSnapshotBusy = false;
+        m_resourceCapture.clear();
+        m_resourceMarkerTail.clear();
+        m_resourceSnapshotText = QStringLiteral("资源快照命令发送失败");
+        emit resourceSnapshotChanged();
+    }
 }
 
 void AppController::activateEditorPath(const QString &path) {
@@ -366,8 +430,8 @@ void AppController::ingestRustEvents(const RustEventBatch &batch) {
             setConnectionState(ev.state);
             break;
         case RsEventKind_Data:
-            captureResourceOutput(ev.data);
-            m_terminal->appendBytes(ev.data);
+            if (!captureResourceOutput(ev.data))
+                m_terminal->appendBytes(ev.data);
             break;
         case RsEventKind_Error: {
             const QString msg =
@@ -479,8 +543,11 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
         case PendingFs::Mutate:
             if (result.kind == RsFsResultKind_Ok) {
                 m_terminal->appendNotice(QStringLiteral("文件操作完成。"));
-                if (pending.path == m_editor->path())
-                    m_editor->closePath(pending.path);
+                if (pending.mutation == PendingFs::DeleteLike) {
+                    m_editor->removePath(pending.path, pending.recursive);
+                } else if (pending.mutation == PendingFs::MoveLike) {
+                    m_editor->movePath(pending.path, pending.destinationPath);
+                }
                 if (pending.clearClipboard) {
                     m_clipboardPath.clear();
                     m_clipboardCut = false;
@@ -563,8 +630,14 @@ void AppController::paste(const QString &destDir) {
                                                 : QStringLiteral("无法提交复制请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, m_clipboardCut ? source : dest, destDir,
-                                 m_clipboardCut ? sourceParent : QString(), m_clipboardCut});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate,
+                                 m_clipboardCut ? source : dest,
+                                 destDir,
+                                 m_clipboardCut ? sourceParent : QString(),
+                                 m_clipboardCut,
+                                 m_clipboardCut ? PendingFs::MoveLike : PendingFs::CopyLike,
+                                 dest,
+                                 false});
 }
 
 void AppController::renamePath(const QString &path, const QString &newName) {
@@ -586,7 +659,8 @@ void AppController::renamePath(const QString &path, const QString &newName) {
         m_terminal->appendNotice(QStringLiteral("无法提交重命名请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parent});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parent, {}, false,
+                                 PendingFs::MoveLike, dest, false});
 }
 
 void AppController::deletePath(const QString &path, bool isDir) {
@@ -603,7 +677,8 @@ void AppController::deletePath(const QString &path, bool isDir) {
         m_terminal->appendNotice(QStringLiteral("无法提交删除请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parent});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parent, {}, false,
+                                 PendingFs::DeleteLike, {}, isDir});
 }
 
 void AppController::makeDir(const QString &parentDir, const QString &name) {
@@ -622,7 +697,8 @@ void AppController::makeDir(const QString &parentDir, const QString &name) {
         m_terminal->appendNotice(QStringLiteral("无法提交新建目录请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parentDir});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parentDir, {}, false,
+                                 PendingFs::CreateLike, path, false});
 }
 
 void AppController::makeFile(const QString &parentDir, const QString &name) {
@@ -641,7 +717,8 @@ void AppController::makeFile(const QString &parentDir, const QString &name) {
         m_terminal->appendNotice(QStringLiteral("无法提交新建文件请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parentDir});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parentDir, {}, false,
+                                 PendingFs::CreateLike, path, false});
 }
 
 void AppController::uploadFile(const QString &destDir, const QUrl &localFile) {
@@ -664,7 +741,8 @@ void AppController::uploadFile(const QString &destDir, const QUrl &localFile) {
         m_terminal->appendNotice(QStringLiteral("无法提交上传请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, dest, destDir});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, dest, destDir, {}, false,
+                                 PendingFs::CreateLike, dest, false});
 }
 
 void AppController::saveEditor(const QString &text) {
@@ -698,9 +776,13 @@ void AppController::setConnectionState(RsSessionState state) {
     } else if (state == RsSessionState_Disconnected || state == RsSessionState_Failed) {
         clearPendingFs();
         m_remoteHomePath.clear();
+        m_resourceSnapshotBusy = false;
+        m_resourceCapture.clear();
+        m_resourceMarkerTail.clear();
+        emit resourceSnapshotChanged();
         setFileStatus(false, QStringLiteral("连接后显示远端文件"));
         m_fileTree->clearTree();
-        m_editor->close();
+        m_editor->removePath({}, true);
     }
 }
 
@@ -713,11 +795,49 @@ void AppController::teardownSession() {
     m_clipboardPath.clear();
     m_clipboardCut = false;
     m_remoteHomePath.clear();
+    m_resourceSnapshotBusy = false;
+    m_resourceCapture.clear();
+    m_resourceMarkerTail.clear();
+    emit resourceSnapshotChanged();
     setFileStatus(false, QStringLiteral("连接后显示远端文件"));
     emit clipboardChanged();
     m_fileTree->clearTree();
-    m_editor->close();
+    m_editor->removePath({}, true);
     m_currentIndex = -1;
+}
+
+void AppController::loadServers() {
+    QSettings settings;
+    const int size = settings.beginReadArray(QStringLiteral("servers"));
+    for (int i = 0; i < size; ++i) {
+        settings.setArrayIndex(i);
+        const QString host = settings.value(QStringLiteral("host")).toString().trimmed();
+        const QString username =
+            settings.value(QStringLiteral("username")).toString().trimmed();
+        if (host.isEmpty() || username.isEmpty())
+            continue;
+        const QString name = settings.value(QStringLiteral("name")).toString();
+        const int port = settings.value(QStringLiteral("port"), 22).toInt();
+        const QString keyPath = settings.value(QStringLiteral("keyPath")).toString();
+        m_servers->addServer(name, host, port, username,
+                             static_cast<int>(RsProviderKind_Russh), keyPath);
+    }
+    settings.endArray();
+}
+
+void AppController::saveServers() const {
+    QSettings settings;
+    settings.beginWriteArray(QStringLiteral("servers"));
+    for (int i = 0; i < m_servers->count(); ++i) {
+        const ServerItem &item = m_servers->itemAt(i);
+        settings.setArrayIndex(i);
+        settings.setValue(QStringLiteral("name"), item.name);
+        settings.setValue(QStringLiteral("host"), item.host);
+        settings.setValue(QStringLiteral("port"), item.port);
+        settings.setValue(QStringLiteral("username"), item.username);
+        settings.setValue(QStringLiteral("keyPath"), item.keyPath);
+    }
+    settings.endArray();
 }
 
 QString AppController::endpointFor(int index) const {
@@ -1051,33 +1171,30 @@ void AppController::parseResourceSnapshot(const QString &text) {
     }
 }
 
-void AppController::captureResourceOutput(const QByteArray &data) {
+bool AppController::captureResourceOutput(const QByteArray &data) {
+    if (!m_resourceSnapshotBusy)
+        return false;
+
     const QString chunk = QString::fromUtf8(data);
     QString captureChunk = chunk;
-    if (!m_resourceSnapshotBusy) {
+    if (!containsMarkerLine(m_resourceCapture, kResourceBegin)) {
         const QString probe = m_resourceMarkerTail + chunk;
         if (!containsMarkerLine(probe, kResourceBegin)) {
             m_resourceMarkerTail = probe.right(QString::fromLatin1(kResourceBegin).size() + 2);
-            return;
+            return true;
         }
         captureChunk = probe;
         m_resourceMarkerTail.clear();
-        m_resourceSnapshotBusy = true;
     }
 
     m_resourceCapture.append(captureChunk);
-    if (!containsMarkerLine(m_resourceCapture, kResourceBegin)) {
-        m_resourceCapture = m_resourceCapture.right(QString::fromLatin1(kResourceBegin).size() + 2);
-        return;
-    }
-
     if (m_resourceCapture.size() > 50000) {
         m_resourceSnapshotBusy = false;
         m_resourceSnapshotText = QStringLiteral("资源快照过长，已停止解析");
         m_resourceCapture.clear();
         m_resourceMarkerTail.clear();
         emit resourceSnapshotChanged();
-        return;
+        return true;
     }
     if (extractMarkedBody(m_resourceCapture, nullptr)) {
         const QString captured = m_resourceCapture;
@@ -1085,6 +1202,7 @@ void AppController::captureResourceOutput(const QByteArray &data) {
         m_resourceMarkerTail.clear();
         parseResourceSnapshot(captured);
     }
+    return true;
 }
 
 void AppController::rebuildResourceProcessGroups() {

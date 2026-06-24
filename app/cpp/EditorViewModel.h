@@ -33,6 +33,8 @@ public:
     void failOpen(const QString &path, const QString &message = {});
     void activatePath(const QString &path);
     void closePath(const QString &path);
+    void removePath(const QString &path, bool recursive);
+    void movePath(const QString &fromPath, const QString &toPath);
     void beginSave();
     void finishSave(bool ok, const QString &message = {}, const QString &path = {});
     void close();
@@ -42,6 +44,8 @@ signals:
     // Carries freshly loaded text for the QML editor to display.
     void contentLoaded(const QString &path, const QString &text);
     void pathClosed(const QString &path);
+    void pathRemoved(const QString &path, bool recursive);
+    void pathMoved(const QString &fromPath, const QString &toPath);
     void openFailed(const QString &path, const QString &message);
     void saveSucceeded(const QString &path);
     void saveFailed(const QString &path, const QString &message);

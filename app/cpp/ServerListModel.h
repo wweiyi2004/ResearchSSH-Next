@@ -18,7 +18,7 @@ struct ServerItem {
     QString host;
     quint16 port = 22;
     QString username;
-    RsProviderKind provider = RsProviderKind_Mock;
+    RsProviderKind provider = RsProviderKind_Russh;
     int status = RsSessionState_Idle; // mirrors RsSessionState
     // Optional private-key path for public-key auth ("" = auto-discover ~/.ssh).
     // Kept last so existing aggregate initialisations stay valid.
@@ -46,13 +46,11 @@ public:
     QVariant data(const QModelIndex &index, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
 
-    // Seed the model with a few demo servers (incl. one that fails to connect).
-    void seedDemoServers();
-
     // Access for the controller.
     bool isValidIndex(int row) const { return row >= 0 && row < m_items.size(); }
     const ServerItem &itemAt(int row) const { return m_items.at(row); }
     void setStatus(int row, RsSessionState status);
+    bool removeServer(int row);
 
     Q_INVOKABLE int count() const { return static_cast<int>(m_items.size()); }
 
