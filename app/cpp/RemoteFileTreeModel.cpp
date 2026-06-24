@@ -1,5 +1,7 @@
 #include "RemoteFileTreeModel.h"
 
+#include <QSet>
+
 namespace researchssh {
 
 RemoteFileTreeModel::RemoteFileTreeModel(QObject *parent) : QAbstractItemModel(parent) {
@@ -178,30 +180,46 @@ void RemoteFileTreeModel::applyListing(const QString &path, const QVector<FsEntr
         return;
     const QModelIndex parentIndex = indexForNode(parentNode);
 
-    // Replace existing children (supports refresh).
-    if (!parentNode->children.isEmpty()) {
-        beginRemoveRows(parentIndex, 0, static_cast<int>(parentNode->children.size()) - 1);
-        for (Node *c : parentNode->children)
-            removePathIndex(c);
-        qDeleteAll(parentNode->children);
-        parentNode->children.clear();
+    QSet<QString> incomingPaths;
+    for (const FsEntry &entry : entries)
+        incomingPaths.insert(entry.path);
+
+    for (int row = parentNode->children.size() - 1; row >= 0; --row) {
+        Node *child = parentNode->children.at(row);
+        if (incomingPaths.contains(child->path))
+            continue;
+        beginRemoveRows(parentIndex, row, row);
+        parentNode->children.removeAt(row);
+        removePathIndex(child);
+        delete child;
         endRemoveRows();
     }
 
-    if (!entries.isEmpty()) {
-        beginInsertRows(parentIndex, 0, static_cast<int>(entries.size()) - 1);
-        for (const FsEntry &e : entries) {
-            Node *child = new Node();
-            child->name = e.name;
-            child->path = e.path;
-            child->isDir = (e.kind == 1); // RsFileKind_Directory
-            child->size = e.size;
-            child->editable = e.editable;
-            child->parent = parentNode;
-            parentNode->children.push_back(child);
-            if (!child->path.isEmpty())
-                m_byPath.insert(child->path, child);
+    for (const FsEntry &e : entries) {
+        if (Node *existing = nodeForPath(e.path)) {
+            existing->name = e.name;
+            existing->isDir = (e.kind == 1); // RsFileKind_Directory
+            existing->size = e.size;
+            existing->editable = e.editable;
+            const QModelIndex changed = indexForNode(existing);
+            if (changed.isValid())
+                emit dataChanged(changed, changed,
+                                 {NameRole, FileNameRole, IsDirRole, SizeRole, EditableRole});
+            continue;
         }
+
+        const int row = parentNode->children.size();
+        beginInsertRows(parentIndex, row, row);
+        Node *child = new Node();
+        child->name = e.name;
+        child->path = e.path;
+        child->isDir = (e.kind == 1); // RsFileKind_Directory
+        child->size = e.size;
+        child->editable = e.editable;
+        child->parent = parentNode;
+        parentNode->children.push_back(child);
+        if (!child->path.isEmpty())
+            m_byPath.insert(child->path, child);
         endInsertRows();
     }
 

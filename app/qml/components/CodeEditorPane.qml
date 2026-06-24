@@ -20,6 +20,12 @@ Rectangle {
     readonly property bool activeDocumentLoading: root.activeDocumentIndex >= 0
                                                   && root.activeDocumentIndex < root.openDocuments.length
                                                   && !!root.openDocuments[root.activeDocumentIndex].loading
+    readonly property bool activeDocumentSaving: root.activeDocumentIndex >= 0
+                                                 && root.activeDocumentIndex < root.openDocuments.length
+                                                 && !!root.openDocuments[root.activeDocumentIndex].saving
+    readonly property bool activeDocumentRemoteMissing: root.activeDocumentIndex >= 0
+                                                        && root.activeDocumentIndex < root.openDocuments.length
+                                                        && !!root.openDocuments[root.activeDocumentIndex].remoteMissing
     readonly property string currentLanguage: languageForPath(root.activePath)
     readonly property bool pythonOpen: currentLanguage === "python"
     property var completionSuggestions: []
@@ -48,7 +54,10 @@ Rectangle {
             name: root.fileNameOf(path),
             text: "",
             modified: false,
-            loading: true
+            loading: true,
+            saving: false,
+            remoteMissing: false,
+            cursorPosition: 0
         }
         var docs = root.openDocuments.slice()
         docs.push(doc)
@@ -61,9 +70,11 @@ Rectangle {
     function saveCurrent() {
         if (root.controller.connected && root.controller.fileAvailable
                 && root.activeDocumentIndex >= 0 && !root.activeDocumentLoading
-                && root.modified && !root.controller.editor.saving) {
+                && !root.activeDocumentSaving && !root.activeDocumentRemoteMissing
+                && root.modified) {
             if (root.activePath.length > 0)
                 root.controller.activateEditorPath(root.activePath)
+            root.setActiveSaving(true)
             root.controller.saveEditor(editorText.text)
         }
     }
@@ -72,6 +83,20 @@ Rectangle {
         var text = String(path)
         var slash = text.lastIndexOf("/")
         return slash >= 0 ? text.slice(slash + 1) : text
+    }
+
+    function pathMatches(path, target, recursive) {
+        if (target.length === 0)
+            return recursive
+        return path === target || (recursive && path.indexOf(target + "/") === 0)
+    }
+
+    function movedPath(path, fromPath, toPath) {
+        if (path === fromPath)
+            return toPath
+        if (path.indexOf(fromPath + "/") === 0)
+            return toPath + path.slice(fromPath.length)
+        return path
     }
 
     function findDocumentIndex(path) {
@@ -115,7 +140,10 @@ Rectangle {
             name: root.fileNameOf(path),
             text: text,
             modified: modified,
-            loading: loading
+            loading: loading,
+            saving: false,
+            remoteMissing: false,
+            cursorPosition: 0
         }
     }
 
@@ -125,6 +153,7 @@ Rectangle {
             return
         var doc = Object.assign({}, root.openDocuments[root.activeDocumentIndex])
         doc.text = editorText.text
+        doc.cursorPosition = editorText.cursorPosition
         root.replaceDocument(root.activeDocumentIndex, doc)
     }
 
@@ -137,7 +166,7 @@ Rectangle {
         var doc = root.openDocuments[index]
         root.loadingText = true
         editorText.text = doc.text || ""
-        editorText.cursorPosition = 0
+        editorText.cursorPosition = Math.min(doc.cursorPosition || 0, editorText.text.length)
         root.loadingText = false
         root.modified = !!doc.modified
         root.controller.activateEditorPath(doc.path)
@@ -162,9 +191,21 @@ Rectangle {
         var doc = Object.assign({}, root.openDocuments[root.activeDocumentIndex])
         doc.modified = value
         doc.text = editorText.text
+        doc.cursorPosition = editorText.cursorPosition
         doc.loading = false
         root.replaceDocument(root.activeDocumentIndex, doc)
         root.modified = value
+    }
+
+    function setActiveSaving(value) {
+        if (root.activeDocumentIndex < 0
+                || root.activeDocumentIndex >= root.openDocuments.length)
+            return
+        var doc = Object.assign({}, root.openDocuments[root.activeDocumentIndex])
+        doc.saving = value
+        doc.text = editorText.text
+        doc.cursorPosition = editorText.cursorPosition
+        root.replaceDocument(root.activeDocumentIndex, doc)
     }
 
     function upsertLoadedDocument(path, text) {
@@ -189,7 +230,7 @@ Rectangle {
         if (root.pendingOpenPath === path)
             root.pendingOpenPath = ""
         if (shouldActivate) {
-            root.activateDocument(index, false, true)
+            root.activateDocument(index, false, false)
         } else if (wasActive) {
             root.activateDocument(index, false, false)
         } else if (root.activePath.length > 0) {
@@ -225,6 +266,64 @@ Rectangle {
         } else if (index < root.activeDocumentIndex) {
             root.activeDocumentIndex -= 1
         }
+    }
+
+    function handlePathRemoved(path, recursive) {
+        root.persistActiveText()
+        var oldActivePath = root.activePath
+        var oldActiveIndex = root.activeDocumentIndex
+        var docs = root.openDocuments.slice()
+        for (var i = docs.length - 1; i >= 0; --i) {
+            if (!root.pathMatches(docs[i].path, path, recursive))
+                continue
+            if (docs[i].modified) {
+                var dirty = Object.assign({}, docs[i])
+                dirty.remoteMissing = true
+                dirty.saving = false
+                dirty.loading = false
+                docs[i] = dirty
+            } else {
+                docs.splice(i, 1)
+            }
+        }
+        root.openDocuments = docs
+        if (docs.length === 0) {
+            root.activeDocumentIndex = -1
+            root.modified = false
+            root.loadingText = true
+            editorText.text = ""
+            root.loadingText = false
+            root.controller.closeEditor()
+            return
+        }
+        var activeIndex = root.findDocumentIndex(oldActivePath)
+        if (activeIndex >= 0) {
+            root.activeDocumentIndex = activeIndex
+            root.modified = !!root.openDocuments[activeIndex].modified
+            return
+        }
+        root.activateDocument(Math.min(oldActiveIndex, docs.length - 1), false, false)
+    }
+
+    function handlePathMoved(fromPath, toPath) {
+        root.persistActiveText()
+        var docs = root.openDocuments.slice()
+        var changed = false
+        for (var i = 0; i < docs.length; ++i) {
+            if (!root.pathMatches(docs[i].path, fromPath, true))
+                continue
+            var doc = Object.assign({}, docs[i])
+            doc.path = root.movedPath(doc.path, fromPath, toPath)
+            doc.name = root.fileNameOf(doc.path)
+            doc.remoteMissing = false
+            docs[i] = doc
+            changed = true
+        }
+        if (!changed)
+            return
+        root.openDocuments = docs
+        if (root.activePath.length > 0)
+            root.controller.activateEditorPath(root.activePath)
     }
 
     function requestCloseDocument(index) {
@@ -504,7 +603,8 @@ Rectangle {
                  && root.activeDocumentIndex >= 0
                  && root.modified
                  && !root.activeDocumentLoading
-                 && !root.controller.editor.saving
+                 && !root.activeDocumentSaving
+                 && !root.activeDocumentRemoteMissing
         onActivated: root.saveCurrent()
     }
 
@@ -546,7 +646,9 @@ Rectangle {
                     Text {
                         Layout.fillWidth: true
                         text: root.activeDocumentIndex >= 0
-                              ? root.openDocuments[root.activeDocumentIndex].name + (root.modified ? " *" : "")
+                              ? root.openDocuments[root.activeDocumentIndex].name
+                                + (root.modified ? " *" : "")
+                                + (root.activeDocumentRemoteMissing ? " !" : "")
                               : "未打开文件"
                         color: Theme.textSoft
                         font.pixelSize: 14
@@ -572,9 +674,13 @@ Rectangle {
                 }
 
                 Text {
-                    visible: root.controller.editor.saving || root.modified
-                    text: root.controller.editor.saving ? "保存中" : "未保存"
-                    color: root.controller.editor.saving ? Theme.accent : Theme.warning
+                    visible: root.activeDocumentSaving || root.modified || root.activeDocumentRemoteMissing
+                    text: root.activeDocumentRemoteMissing
+                          ? "远端已删除"
+                          : (root.activeDocumentSaving ? "保存中" : "未保存")
+                    color: root.activeDocumentRemoteMissing
+                           ? Theme.danger
+                           : (root.activeDocumentSaving ? Theme.accent : Theme.warning)
                     font.pixelSize: 12
                 }
 
@@ -623,7 +729,8 @@ Rectangle {
                              && root.activeDocumentIndex >= 0
                              && root.modified
                              && !root.activeDocumentLoading
-                             && !root.controller.editor.saving
+                             && !root.activeDocumentSaving
+                             && !root.activeDocumentRemoteMissing
                     onClicked: root.saveCurrent()
                 }
             }
@@ -676,6 +783,7 @@ Rectangle {
                                     Layout.fillWidth: true
                                     text: modelData.name
                                           + (modelData.loading ? " ..." : (modelData.modified ? " *" : ""))
+                                          + (modelData.remoteMissing ? " !" : "")
                                     color: index === root.activeDocumentIndex ? Theme.text : Theme.muted
                                     font.pixelSize: 12
                                     elide: Text.ElideMiddle
@@ -757,7 +865,7 @@ Rectangle {
                 anchors.fill: parent
                 anchors.leftMargin: 52
                 enabled: root.activeDocumentIndex >= 0 && !root.activeDocumentLoading
-                         && !root.controller.editor.saving
+                         && !root.activeDocumentSaving
                 selectByMouse: true
                 wrapMode: TextArea.NoWrap
                 color: Theme.textSoft
@@ -773,9 +881,10 @@ Rectangle {
                 placeholderTextColor: Theme.faint
                 background: Rectangle { color: Theme.editor }
                 onTextChanged: {
-                    if (!root.loadingText && root.activeDocumentIndex >= 0)
+                    if (!root.loadingText && root.activeDocumentIndex >= 0
+                            && !root.activeDocumentLoading)
                         root.setActiveModified(true)
-                    if (!root.loadingText)
+                    if (!root.loadingText && !root.activeDocumentLoading)
                         root.updateCompletion(false)
                 }
                 onCursorPositionChanged: {
@@ -909,7 +1018,11 @@ Rectangle {
                 Item { Layout.fillWidth: true }
                 Text {
                     text: root.activeDocumentIndex >= 0
-                          ? (root.modified ? "已修改" : "已保存")
+                          ? (root.activeDocumentRemoteMissing
+                             ? "远端已删除"
+                             : (root.activeDocumentSaving
+                                ? "保存中"
+                                : (root.modified ? "已修改" : "已保存")))
                           : ""
                     color: "#ffffff"
                     font.pixelSize: 11
@@ -921,7 +1034,8 @@ Rectangle {
     Connections {
         target: root.controller.editor
         function onChanged() {
-            if (!root.controller.editor.isOpen && !root.controller.editor.busy) {
+            if (!root.controller.editor.isOpen && !root.controller.editor.busy
+                    && root.openDocuments.length === 0) {
                 root.openDocuments = []
                 root.activeDocumentIndex = -1
                 root.pendingOpenPath = ""
@@ -935,9 +1049,13 @@ Rectangle {
             root.upsertLoadedDocument(path, text)
         }
         function onPathClosed(path) {
-            var index = root.findDocumentIndex(path)
-            if (index >= 0)
-                root.closeDocument(index)
+            root.handlePathRemoved(path, false)
+        }
+        function onPathRemoved(path, recursive) {
+            root.handlePathRemoved(path, recursive)
+        }
+        function onPathMoved(fromPath, toPath) {
+            root.handlePathMoved(fromPath, toPath)
         }
         function onOpenFailed(path, message) {
             root.handleOpenFailed(path, message)
@@ -948,8 +1066,11 @@ Rectangle {
                 return
             var doc = Object.assign({}, root.openDocuments[index])
             doc.modified = false
-            if (index === root.activeDocumentIndex)
+            doc.saving = false
+            if (index === root.activeDocumentIndex) {
                 doc.text = editorText.text
+                doc.cursorPosition = editorText.cursorPosition
+            }
             root.replaceDocument(index, doc)
             if (index === root.activeDocumentIndex)
                 root.modified = false
@@ -960,6 +1081,11 @@ Rectangle {
                 return
             var doc = Object.assign({}, root.openDocuments[index])
             doc.modified = true
+            doc.saving = false
+            if (index === root.activeDocumentIndex) {
+                doc.text = editorText.text
+                doc.cursorPosition = editorText.cursorPosition
+            }
             root.replaceDocument(index, doc)
             if (index === root.activeDocumentIndex)
                 root.modified = true

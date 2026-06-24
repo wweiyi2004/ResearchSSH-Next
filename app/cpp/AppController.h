@@ -164,6 +164,10 @@ private:
         QString refreshDir;      // for Mutate: directory to re-list on success
         QString extraRefreshDir; // optional second directory for moves
         bool clearClipboard = false;
+        enum Mutation { NoMutation, CreateLike, CopyLike, MoveLike, DeleteLike } mutation =
+            NoMutation;
+        QString destinationPath;
+        bool recursive = false;
     };
     void trackFsRequest(quint64 requestId, const PendingFs &pending);
     void clearPendingFs();

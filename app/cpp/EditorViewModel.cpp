@@ -49,6 +49,21 @@ void EditorViewModel::closePath(const QString &path) {
     emit pathClosed(path);
 }
 
+void EditorViewModel::removePath(const QString &path, bool recursive) {
+    if (path.isEmpty() && !recursive)
+        return;
+    emit pathRemoved(path, recursive);
+}
+
+void EditorViewModel::movePath(const QString &fromPath, const QString &toPath) {
+    if (fromPath.isEmpty() || toPath.isEmpty())
+        return;
+    if (m_path == fromPath || m_path.startsWith(fromPath + QLatin1Char('/')))
+        m_path = toPath + m_path.mid(fromPath.size());
+    emit pathMoved(fromPath, toPath);
+    emit changed();
+}
+
 void EditorViewModel::beginSave() {
     if (!m_isOpen)
         return;

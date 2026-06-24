@@ -9,6 +9,7 @@ Rectangle {
     id: root
     property var controller
     property bool showHeader: true
+    property bool followOutput: true
     property var completionSuggestions: []
     property string completionPrefix: ""
     color: Theme.window
@@ -76,6 +77,11 @@ Rectangle {
         terminalCompletion.close()
     }
 
+    function outputAtBottom() {
+        return !outputScrollBar.visible
+               || outputScrollBar.position + outputScrollBar.size >= 0.98
+    }
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
@@ -92,7 +98,12 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+            ScrollBar.vertical: ScrollBar {
+                id: outputScrollBar
+                policy: ScrollBar.AsNeeded
+                onPositionChanged: root.followOutput = root.outputAtBottom()
+                onSizeChanged: root.followOutput = root.outputAtBottom()
+            }
 
             TextArea {
                 id: output
@@ -105,8 +116,10 @@ Rectangle {
                 font.family: "Cascadia Mono"
                 background: Rectangle { color: Theme.terminal }
                 padding: 14
-                // Keep the latest output in view.
-                onTextChanged: output.cursorPosition = output.length
+                onTextChanged: {
+                    if (root.followOutput)
+                        output.cursorPosition = output.length
+                }
             }
         }
 

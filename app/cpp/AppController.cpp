@@ -479,8 +479,11 @@ void AppController::ingestFileResults(const FsResultBatch &batch) {
         case PendingFs::Mutate:
             if (result.kind == RsFsResultKind_Ok) {
                 m_terminal->appendNotice(QStringLiteral("文件操作完成。"));
-                if (pending.path == m_editor->path())
-                    m_editor->closePath(pending.path);
+                if (pending.mutation == PendingFs::DeleteLike) {
+                    m_editor->removePath(pending.path, pending.recursive);
+                } else if (pending.mutation == PendingFs::MoveLike) {
+                    m_editor->movePath(pending.path, pending.destinationPath);
+                }
                 if (pending.clearClipboard) {
                     m_clipboardPath.clear();
                     m_clipboardCut = false;
@@ -563,8 +566,14 @@ void AppController::paste(const QString &destDir) {
                                                 : QStringLiteral("无法提交复制请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, m_clipboardCut ? source : dest, destDir,
-                                 m_clipboardCut ? sourceParent : QString(), m_clipboardCut});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate,
+                                 m_clipboardCut ? source : dest,
+                                 destDir,
+                                 m_clipboardCut ? sourceParent : QString(),
+                                 m_clipboardCut,
+                                 m_clipboardCut ? PendingFs::MoveLike : PendingFs::CopyLike,
+                                 dest,
+                                 false});
 }
 
 void AppController::renamePath(const QString &path, const QString &newName) {
@@ -586,7 +595,8 @@ void AppController::renamePath(const QString &path, const QString &newName) {
         m_terminal->appendNotice(QStringLiteral("无法提交重命名请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parent});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parent, {}, false,
+                                 PendingFs::MoveLike, dest, false});
 }
 
 void AppController::deletePath(const QString &path, bool isDir) {
@@ -603,7 +613,8 @@ void AppController::deletePath(const QString &path, bool isDir) {
         m_terminal->appendNotice(QStringLiteral("无法提交删除请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parent});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parent, {}, false,
+                                 PendingFs::DeleteLike, {}, isDir});
 }
 
 void AppController::makeDir(const QString &parentDir, const QString &name) {
@@ -622,7 +633,8 @@ void AppController::makeDir(const QString &parentDir, const QString &name) {
         m_terminal->appendNotice(QStringLiteral("无法提交新建目录请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parentDir});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parentDir, {}, false,
+                                 PendingFs::CreateLike, path, false});
 }
 
 void AppController::makeFile(const QString &parentDir, const QString &name) {
@@ -641,7 +653,8 @@ void AppController::makeFile(const QString &parentDir, const QString &name) {
         m_terminal->appendNotice(QStringLiteral("无法提交新建文件请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parentDir});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, path, parentDir, {}, false,
+                                 PendingFs::CreateLike, path, false});
 }
 
 void AppController::uploadFile(const QString &destDir, const QUrl &localFile) {
@@ -664,7 +677,8 @@ void AppController::uploadFile(const QString &destDir, const QUrl &localFile) {
         m_terminal->appendNotice(QStringLiteral("无法提交上传请求。"));
         return;
     }
-    trackFsRequest(id, PendingFs{PendingFs::Mutate, dest, destDir});
+    trackFsRequest(id, PendingFs{PendingFs::Mutate, dest, destDir, {}, false,
+                                 PendingFs::CreateLike, dest, false});
 }
 
 void AppController::saveEditor(const QString &text) {
@@ -698,9 +712,13 @@ void AppController::setConnectionState(RsSessionState state) {
     } else if (state == RsSessionState_Disconnected || state == RsSessionState_Failed) {
         clearPendingFs();
         m_remoteHomePath.clear();
+        m_resourceSnapshotBusy = false;
+        m_resourceCapture.clear();
+        m_resourceMarkerTail.clear();
+        emit resourceSnapshotChanged();
         setFileStatus(false, QStringLiteral("连接后显示远端文件"));
         m_fileTree->clearTree();
-        m_editor->close();
+        m_editor->removePath({}, true);
     }
 }
 
@@ -713,10 +731,14 @@ void AppController::teardownSession() {
     m_clipboardPath.clear();
     m_clipboardCut = false;
     m_remoteHomePath.clear();
+    m_resourceSnapshotBusy = false;
+    m_resourceCapture.clear();
+    m_resourceMarkerTail.clear();
+    emit resourceSnapshotChanged();
     setFileStatus(false, QStringLiteral("连接后显示远端文件"));
     emit clipboardChanged();
     m_fileTree->clearTree();
-    m_editor->close();
+    m_editor->removePath({}, true);
     m_currentIndex = -1;
 }
 
@@ -1052,9 +1074,12 @@ void AppController::parseResourceSnapshot(const QString &text) {
 }
 
 void AppController::captureResourceOutput(const QByteArray &data) {
+    if (!m_resourceSnapshotBusy)
+        return;
+
     const QString chunk = QString::fromUtf8(data);
     QString captureChunk = chunk;
-    if (!m_resourceSnapshotBusy) {
+    if (!containsMarkerLine(m_resourceCapture, kResourceBegin)) {
         const QString probe = m_resourceMarkerTail + chunk;
         if (!containsMarkerLine(probe, kResourceBegin)) {
             m_resourceMarkerTail = probe.right(QString::fromLatin1(kResourceBegin).size() + 2);
@@ -1062,15 +1087,9 @@ void AppController::captureResourceOutput(const QByteArray &data) {
         }
         captureChunk = probe;
         m_resourceMarkerTail.clear();
-        m_resourceSnapshotBusy = true;
     }
 
     m_resourceCapture.append(captureChunk);
-    if (!containsMarkerLine(m_resourceCapture, kResourceBegin)) {
-        m_resourceCapture = m_resourceCapture.right(QString::fromLatin1(kResourceBegin).size() + 2);
-        return;
-    }
-
     if (m_resourceCapture.size() > 50000) {
         m_resourceSnapshotBusy = false;
         m_resourceSnapshotText = QStringLiteral("资源快照过长，已停止解析");
