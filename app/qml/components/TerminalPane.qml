@@ -80,7 +80,7 @@ Rectangle {
     }
 
     function outputAtBottom() {
-        return !outputScrollBar.visible
+        return outputScrollBar.size >= 0.99
                || outputScrollBar.position + outputScrollBar.size >= 0.98
     }
 
@@ -139,11 +139,36 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
+            rightPadding: 12
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
             ScrollBar.vertical: ScrollBar {
                 id: outputScrollBar
-                policy: ScrollBar.AsNeeded
+                policy: ScrollBar.AlwaysOn
+                interactive: true
+                minimumSize: 0.08
+                width: 12
                 onPositionChanged: root.followOutput = root.outputAtBottom()
                 onSizeChanged: root.followOutput = root.outputAtBottom()
+
+                background: Rectangle {
+                    implicitWidth: 12
+                    color: Theme.terminal
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: 1
+                        height: parent.height
+                        color: Theme.border
+                    }
+                }
+
+                contentItem: Rectangle {
+                    implicitWidth: 8
+                    radius: 4
+                    color: outputScrollBar.pressed || outputScrollBar.hovered
+                           ? Theme.accent
+                           : Theme.muted
+                    opacity: outputScrollBar.size < 0.99 ? 0.85 : 0.25
+                }
             }
 
             TextArea {
